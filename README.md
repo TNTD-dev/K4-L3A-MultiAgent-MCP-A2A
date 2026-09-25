@@ -54,6 +54,18 @@ COMPETITION_TEAM_API_KEY=sk-team-your_key
 MCP_ENDPOINT=http://127.0.0.1:8001/mcp
 ```
 
+Có thể bật kiến trúc hybrid (MCP evidence + Structured Outputs) bằng các biến:
+
+```dotenv
+OPENAI_API_KEY=sk-proj-your_key
+OPENAI_MODEL=gpt-5.6-luna
+OPENAI_REASONING_EFFORT=medium
+DAY09_CONCURRENCY=10
+```
+
+`OPENAI_API_KEY` chỉ đặt trong `.env` cục bộ; không commit khóa hoặc đưa khóa
+vào output/trace. Nếu không cấu hình khóa, CLI dùng workflow deterministic.
+
 ## 3. Tải input
 
 Tải ZIP input **L3A** từ GitHub Release và giải nén vào root repo:

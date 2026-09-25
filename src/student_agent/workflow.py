@@ -2021,6 +2021,12 @@ async def solve_case(
 ) -> dict[str, Any]:
     """Run one case and expose contract/gateway failures in the trace."""
 
+    from .hybrid_workflow import enabled as hybrid_enabled
+    from .hybrid_workflow import solve_hybrid_case
+
+    if hybrid_enabled():
+        return await solve_hybrid_case(case, gateway, trace)
+
     case_id = case.get("case_id")
     if not isinstance(case_id, str) or not case_id:
         raise ValueError("case must contain a non-empty case_id")
