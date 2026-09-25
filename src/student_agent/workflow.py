@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
+from math import isfinite
 from typing import Any
 
 from .mcp_gateway import EvidenceGateway
@@ -20,6 +21,12 @@ _ISSUES = {
     "insufficient_evidence",
 }
 _STATUSES = {"action_required", "no_action", "needs_investigation"}
+_PAYMENT_ISSUES = {"valid_split_payment", "payment_mismatch", "duplicate_charge"}
+_REFUND_ISSUES = {"refund_pending", "refund_failed"}
+
+
+def _empty_financial() -> dict[str, Any]:
+    return {"currency": "BRL", "recommended_refund_brl": 0, "refund_lines": []}
 
 
 def _order_id(case: dict[str, Any]) -> str:
@@ -588,6 +595,301 @@ def _verify_slice(
         raise ValueError("verifier: output order is outside the requested scope")
 
 
+def _money(value: Any, label: str) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        raise ValueError(f"{label} is not a number")
+    if isinstance(value, float) and not isfinite(value):
+        raise ValueError(f"{label} is not finite")
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"{label} is not a decimal number") from exc
+    if not amount.is_finite() or amount < 0:
+        raise ValueError(f"{label} must be finite and non-negative")
+    return amount
+
+
+def _json_money(value: Decimal) -> int | float:
+    return int(value) if value == value.to_integral_value() else float(value)
+
+
+def _financial_insufficient(
+    case_id: str, order_id: str, evidence_refs: list[str]
+) -> dict[str, Any]:
+    return {
+        "schema_version": "day09-l3a-output-v2",
+        "case_id": case_id,
+        "assessment": {
+            "primary_issue": "insufficient_evidence",
+            "case_status": "needs_investigation",
+            "confidence": 0.0,
+        },
+        "affected_entities": {
+            "order_ids": [order_id],
+            "item_ids": [],
+            "seller_ids": [],
+            "payment_references": [],
+            "shipment_ids": [],
+        },
+        "root_cause_analysis": {"ranked_causes": [], "responsible_parties": []},
+        "evidence_refs": list(dict.fromkeys(evidence_refs)),
+        "data_conflicts": [],
+        "financial_resolution": _empty_financial(),
+        "resolution_actions": [],
+    }
+
+
+def _financial_decision(data: dict[str, Any], domain: str) -> str | None:
+    issue = data.get("primary_issue")
+    allowed = _PAYMENT_ISSUES if domain == "payment" else _REFUND_ISSUES
+    if isinstance(issue, str) and issue in allowed:
+        return issue
+    if domain == "refund":
+        state = data.get("refund_status")
+        if state in {"pending", "refund_pending"}:
+            return "refund_pending"
+        if state in {"failed", "refund_failed"}:
+            return "refund_failed"
+    return None
+
+
+def _authoritative_entity_ids(records: list[tuple[str, dict[str, Any]]]) -> set[str] | None:
+    ids: set[str] = set()
+    for _, data in records:
+        order_id = data.get("order_id")
+        if not isinstance(order_id, str) or not order_id:
+            return None
+        ids.add(order_id)
+        for key in ("item_ids", "payment_references"):
+            values = data.get(key)
+            if values is None:
+                continue
+            if not isinstance(values, list) or not all(
+                isinstance(value, str) and value for value in values
+            ):
+                return None
+            ids.update(values)
+    return ids
+
+
+def _financial_resolution(
+    records: list[tuple[str, dict[str, Any]]],
+) -> tuple[dict[str, Any], bool]:
+    """Read financial fields only from the scoped refund envelope."""
+
+    source = next((data for domain, data in records if domain == "refund"), None)
+    if source is None or "recommended_refund_brl" not in source or "refund_lines" not in source:
+        return _empty_financial(), False
+    raw_lines = source["refund_lines"]
+    if not isinstance(raw_lines, list):
+        return _empty_financial(), False
+    authoritative_ids = _authoritative_entity_ids(records)
+    if authoritative_ids is None:
+        return _empty_financial(), False
+    try:
+        total = _money(source["recommended_refund_brl"], "recommended_refund_brl")
+        lines: list[dict[str, Any]] = []
+        line_total = Decimal("0")
+        for index, raw_line in enumerate(raw_lines):
+            if not isinstance(raw_line, dict):
+                return _empty_financial(), False
+            reason = raw_line.get("reason_code")
+            entity_id = raw_line.get("entity_id")
+            if not isinstance(reason, str) or not reason:
+                return _empty_financial(), False
+            if entity_id is not None and (
+                not isinstance(entity_id, str) or entity_id not in authoritative_ids
+            ):
+                return _empty_financial(), False
+            amount = _money(raw_line.get("amount_brl"), f"refund_lines[{index}].amount_brl")
+            line_total += amount
+            lines.append(
+                {
+                    "reason_code": reason,
+                    "amount_brl": _json_money(amount),
+                    "entity_id": entity_id,
+                }
+            )
+    except (InvalidOperation, TypeError, ValueError):
+        return _empty_financial(), False
+    if total != line_total:
+        return _empty_financial(), False
+    return {
+        "currency": "BRL",
+        "recommended_refund_brl": _json_money(total),
+        "refund_lines": lines,
+    }, True
+
+
+def _financial_output(
+    case_id: str,
+    records: list[tuple[str, dict[str, Any]]],
+    evidence_refs: list[str],
+    requested_order_id: str,
+) -> dict[str, Any]:
+    payment_records = [data for domain, data in records if domain == "payment"]
+    refund_records = [data for domain, data in records if domain == "refund"]
+    if len(payment_records) != 1 or len(refund_records) != 1:
+        return _financial_insufficient(case_id, requested_order_id, evidence_refs)
+    decisions = []
+    for domain, data in (("payment", payment_records[0]), ("refund", refund_records[0])):
+        if "primary_issue" in data and _financial_decision(data, domain) is None:
+            return _financial_insufficient(case_id, requested_order_id, evidence_refs)
+        issue = _financial_decision(data, domain)
+        if issue is not None:
+            decisions.append(issue)
+    if len(decisions) != 1:
+        return _financial_insufficient(case_id, requested_order_id, evidence_refs)
+    issue = decisions[0]
+    decision_data = payment_records[0] if issue in _PAYMENT_ISSUES else refund_records[0]
+    status = decision_data.get("case_status")
+    confidence = decision_data.get("confidence")
+    actions = decision_data.get("resolution_actions")
+    if (
+        not isinstance(status, str)
+        or status not in _STATUSES
+        or isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not 0 <= confidence <= 1
+        or not isinstance(actions, list)
+        or not all(isinstance(action, str) for action in actions)
+        or (status == "action_required") != bool(actions)
+    ):
+        return _financial_insufficient(case_id, requested_order_id, evidence_refs)
+    financial, valid_financial = _financial_resolution(records)
+    if not valid_financial:
+        return _financial_insufficient(case_id, requested_order_id, evidence_refs)
+    payment_refs: list[str] = []
+    for data in (*payment_records, *refund_records):
+        refs = data.get("payment_references")
+        if refs is None:
+            continue
+        if not isinstance(refs, list) or not all(isinstance(ref, str) for ref in refs):
+            return _financial_insufficient(case_id, requested_order_id, evidence_refs)
+        payment_refs.extend(refs)
+    return {
+        "schema_version": "day09-l3a-output-v2",
+        "case_id": case_id,
+        "assessment": {
+            "primary_issue": issue,
+            "case_status": status,
+            "confidence": confidence,
+        },
+        "affected_entities": {
+            "order_ids": [requested_order_id],
+            "item_ids": [],
+            "seller_ids": [],
+            "payment_references": list(dict.fromkeys(payment_refs)),
+            "shipment_ids": [],
+        },
+        "root_cause_analysis": {"ranked_causes": [], "responsible_parties": []},
+        "evidence_refs": list(dict.fromkeys(evidence_refs)),
+        "data_conflicts": [],
+        "financial_resolution": financial,
+        "resolution_actions": actions,
+    }
+
+
+def _verify_financial(
+    result: dict[str, Any],
+    records: list[tuple[str, dict[str, Any]]],
+    evidence_refs: list[str],
+    requested_order_id: str,
+) -> None:
+    if result["evidence_refs"] != list(dict.fromkeys(evidence_refs)):
+        raise ValueError("verifier: output evidence_refs do not link consumed evidence")
+    if any(data.get("order_id") != requested_order_id for _, data in records):
+        raise ValueError("verifier: financial evidence is outside the requested order")
+    financial = result["financial_resolution"]
+    total = _money(financial["recommended_refund_brl"], "output refund total")
+    line_total = sum(
+        (_money(line["amount_brl"], "output refund line") for line in financial["refund_lines"]),
+        Decimal("0"),
+    )
+    if total != line_total:
+        raise ValueError("verifier: financial total does not equal refund-line sum")
+
+
+def _requested_financial(case: dict[str, Any]) -> bool:
+    request = case.get("customer_request")
+    claims = request.get("claims") if isinstance(request, dict) else None
+    topics = {
+        claim.get("topic")
+        for claim in claims or []
+        if isinstance(claim, dict) and isinstance(claim.get("topic"), str)
+    }
+    return bool(topics & (_PAYMENT_ISSUES | _REFUND_ISSUES))
+
+
+def _financial_tool(tools: list[str], domain: str) -> str | None:
+    name = {"payment": "get_payment", "refund": "get_refund"}[domain]
+    return name if name in tools else None
+
+
+async def _solve_financial(
+    case_id: str,
+    order_id: str,
+    gateway: EvidenceGateway,
+    trace: TraceWriter,
+    tools: list[str],
+) -> dict[str, Any]:
+    contracts = trace.contracts
+    records: list[tuple[str, dict[str, Any]]] = []
+    evidence_refs: list[str] = []
+
+    async def investigate(domain: str, tool_name: str, actor: str) -> None:
+        trace.emit(
+            case_id=case_id,
+            event_type="task_assigned",
+            actor="coordinator",
+            target=actor,
+            decision_code=f"{domain}_lookup",
+        )
+        evidence = await gateway.call(tool_name, case_id=case_id, order_id=order_id)
+        contracts.validate_evidence(evidence, f"MCP tool {tool_name}")
+        data = evidence.get("data")
+        if evidence.get("domain") != domain or not isinstance(data, dict):
+            raise ValueError(f"MCP {tool_name} did not return {domain} evidence")
+        if data.get("order_id") != order_id:
+            raise ValueError(f"MCP {tool_name} returned evidence for a different order")
+        ref = evidence["evidence_ref"]
+        if ref not in evidence_refs:
+            evidence_refs.append(ref)
+            records.append((domain, data))
+        trace.emit(
+            case_id=case_id,
+            event_type="tool_result_consumed",
+            actor=actor,
+            tool_name=tool_name,
+            evidence_refs=[ref],
+        )
+        trace.emit(
+            case_id=case_id,
+            event_type="handoff",
+            actor=actor,
+            target="verifier",
+            decision_code="evidence_ready",
+            evidence_refs=[ref],
+        )
+
+    await investigate("order", "get_order", "order-agent")
+    for domain, actor in (("payment", "payment-agent"), ("refund", "refund-agent")):
+        tool = _financial_tool(tools, domain)
+        if tool is not None:
+            await investigate(domain, tool, actor)
+    result = _financial_output(case_id, records, evidence_refs, order_id)
+    contracts.validate_output(result, f"output/{case_id}")
+    _verify_financial(result, records, evidence_refs, order_id)
+    trace.emit(
+        case_id=case_id,
+        event_type="verification_completed",
+        actor="verifier",
+        decision_code="output_contract_valid",
+        evidence_refs=evidence_refs,
+    )
+    return result
+
+
 async def _solve_order_only(
     case_id: str, order_id: str, gateway: EvidenceGateway, trace: TraceWriter
 ) -> dict[str, Any]:
@@ -623,7 +925,10 @@ async def _solve_order_only(
         decision_code="evidence_ready",
         evidence_refs=[evidence_ref],
     )
-    result = _output(case_id, evidence)
+    if evidence["data"].get("primary_issue") in _PAYMENT_ISSUES | _REFUND_ISSUES:
+        result = _slice_insufficient_output(case_id, evidence, [evidence_ref])
+    else:
+        result = _output(case_id, evidence)
     contracts.validate_output(result, f"output/{case_id}")
     _verify(result, evidence, order_id)
     trace.emit(
@@ -648,6 +953,9 @@ async def solve_case(
     tools = await gateway.list_tools()
     if "get_order" not in tools:
         raise RuntimeError("MCP Gateway does not expose the required get_order tool")
+
+    if _requested_financial(case):
+        return await _solve_financial(case_id, order_id, gateway, trace, tools)
 
     # Keep the issue-1 path contract-compatible for a gateway that only exposes
     # get_order. Once any issue-2 specialist is advertised, use every matching

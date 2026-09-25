@@ -13,7 +13,10 @@ Input → Coordinator → Specialists → Verifier → Output
 ```
 
 The coordinator discovers the server tools, assigns only specialists whose tools
-were advertised, and passes their validated evidence envelopes to the verifier.
+were advertised and whose domain is relevant to the case, and passes their
+validated evidence envelopes to the verifier. Order/item/seller/shipment cases
+use the entity slice; payment/refund cases use the financial slice, which
+requires payment and refund evidence before it can finalize.
 The CLI emits `case_received` and `case_finalized`; `solve_case` emits
 assignments, per-result consumption, handoffs, and verification events between
 them. The input's customer message supplies only lookup and claim identifiers;
@@ -25,7 +28,8 @@ entity facts and claim verdicts are projected from MCP envelopes.
 | --- | --- | --- | --- |
 | Coordinator | case manifest | Validate `case_id`, select the explicit `order_id`, discover tools, and assign only available scoped specialists | `task_assigned` → available specialist |
 | Order/item | explicit `order_id` and coordinator assignment | Call only discovered `get_order`, `get_order_items`, and `get_sellers`; preserve envelopes and project unique item/seller IDs | `tool_result_consumed` → `handoff` to verifier |
-| Payment | not in the first path | Reserved for a later specialist; no payment facts are inferred here | none |
+| Payment | explicit order lookup and financial claim scope | Call only discovered `get_payment`; derive payment issue and payment references from its scoped envelope | `tool_result_consumed` → `handoff` to verifier |
+| Refund | explicit order lookup and financial claim scope | Call only discovered `get_refund`; derive refund state, BRL totals, and refund lines from its scoped envelope | `tool_result_consumed` → `handoff` to verifier |
 | Shipment | explicit `order_id` and coordinator assignment | Call only discovered `get_shipment_summary`; use explicit late events and shipment IDs only | `tool_result_consumed` → `handoff` to verifier |
 | Policy | not in the first path | Reserved for a later specialist; no policy facts are inferred here | none |
 | Verifier | validated MCP envelope and proposed output | Validate evidence and L3A output contracts, then mark verification complete | `verification_completed` → coordinator |
@@ -44,12 +48,14 @@ reasoning is written to trace.
 ## 4. Evidence lifecycle
 
 `EvidenceGateway.call` validates each MCP response against the public evidence
-schema. The workflow validates again when a test stub is used, retains each
-server-issued `evidence_ref` unchanged, filters scoped rows/events, maps only
-fields present in `data` to output, and emits one `tool_result_consumed` per
-result. Missing or malformed specialist data produces an
-insufficient-evidence result; no evidence reference is generated locally or
-reused between cases.
+schema. The gateway request carries the active `case_id`; the public evidence
+envelope has no response `case_id` field, so the workflow scopes returned data
+by the requested `order_id`. The workflow validates again when a test stub is
+used, retains each server-issued `evidence_ref` unchanged, filters scoped
+rows/events, maps only fields present in `data` to output, and emits one
+`tool_result_consumed` per relevant result. Missing or malformed specialist
+data produces an insufficient-evidence result; no evidence reference is
+generated locally or reused between cases.
 
 ## 5. Failure policy
 
@@ -70,15 +76,19 @@ Before finalize the verifier checks the evidence and output schemas, requires th
 all output refs to equal the consumed refs, filters and deduplicates in-scope
 order/item/seller/shipment identifiers, and preserves claim refs. Contradictory
 seller/logistics late events are recorded as a conflict and remain insufficient.
-Unsupported or missing decision domains remain insufficient; the workflow never
-manufactures a shipment ID, seller, cause, action, or refund from a customer
-message. Claim topics are hypotheses, not verdicts.
+For the financial slice, payment decisions come only from payment evidence;
+refund states, recommended totals, and refund lines come only from refund
+evidence. Every refund-line `entity_id` must match an authoritative in-scope
+order, item, or payment reference. Unsupported or missing decision domains
+remain insufficient; the workflow never manufactures a shipment ID, seller,
+cause, action, or refund from a customer message. Claim topics are hypotheses
+used only to select relevant specialists, never verdicts.
 
 ## 7. Reproducibility
 
 The workflow is deterministic apart from trace event IDs and timestamps: one
-call per discovered order/item/seller/shipment tool per case, no concurrency, no
-random seed, and no model call.
+call per discovered relevant tool per case, no concurrency, no random seed, and
+no model call.
 `pyproject.toml` declares bounded dependency version ranges (there is no checked-in
 lockfile); run `pytest -q` and `ruff check .`. API keys are never written to
 source, output, or trace.
