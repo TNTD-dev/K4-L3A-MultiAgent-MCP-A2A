@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from decimal import Decimal, InvalidOperation
 from math import isfinite
 from typing import Any
@@ -28,6 +29,8 @@ _POLICY_TOOL_PREFERENCE = (
     "get_policy_rules",
     "get_policy_evidence",
 )
+_POLICY_REQUIRED_CASE_FIELDS = ("policy_version",)
+_REFUND_ACTION_MARKERS = ("refund", "reimburse", "repay")
 
 
 def _empty_financial() -> dict[str, Any]:
@@ -751,7 +754,7 @@ def _policy_insufficient(
     case_id: str,
     base: dict[str, Any],
     supporting_refs: list[str],
-    policy_ref: str,
+    policy_ref: str | None = None,
 ) -> dict[str, Any]:
     """Preserve verified entities/claim assessments but expose policy uncertainty."""
 
@@ -764,7 +767,9 @@ def _policy_insufficient(
             "confidence": 0.0,
         },
         "root_cause_analysis": {"ranked_causes": [], "responsible_parties": []},
-        "evidence_refs": list(dict.fromkeys([*supporting_refs, policy_ref])),
+        "evidence_refs": list(
+            dict.fromkeys([*supporting_refs, *([policy_ref] if policy_ref else [])])
+        ),
         "financial_resolution": _empty_financial(),
         "resolution_actions": [],
         "data_conflicts": base.get("data_conflicts", []),
@@ -801,6 +806,11 @@ def _policy_output(
     status = decision.get("case_status")
     confidence = decision.get("confidence")
     actions = decision.get("resolution_actions")
+    base_issue = base["assessment"]["primary_issue"]
+    if base_issue == "insufficient_evidence" or (
+        base_issue != issue
+    ):
+        return _policy_insufficient(case_id, base, supporting_refs, policy_ref)
     if (
         not isinstance(issue, str)
         or issue not in _ISSUES
@@ -828,45 +838,6 @@ def _policy_output(
     ):
         return _policy_insufficient(case_id, base, supporting_refs, policy_ref)
 
-    parties = decision.get(
-        "responsible_parties",
-        base["root_cause_analysis"].get("responsible_parties", []),
-    )
-    if not isinstance(parties, list) or len(parties) > 5:
-        return _policy_insufficient(case_id, base, supporting_refs, policy_ref)
-    for party in parties:
-        if (
-            not isinstance(party, dict)
-            or party.get("party_type") not in {
-                "seller",
-                "platform",
-                "logistics_provider",
-                "payment_provider",
-                "customer",
-                "unknown",
-            }
-            or not (isinstance(party.get("party_id"), str) or party.get("party_id") is None)
-            or isinstance(party.get("party_id"), str) and len(party["party_id"]) > 128
-        ):
-            return _policy_insufficient(case_id, base, supporting_refs, policy_ref)
-        if party["party_type"] == "seller" and party["party_id"] not in set(
-            base["affected_entities"].get("seller_ids", [])
-        ):
-            return _policy_insufficient(case_id, base, supporting_refs, policy_ref)
-
-    ranked_causes = decision.get(
-        "ranked_causes", base["root_cause_analysis"].get("ranked_causes", [])
-    )
-    if not isinstance(ranked_causes, list) or len(ranked_causes) > 5 or any(
-        not isinstance(cause, dict)
-        or not isinstance(cause.get("cause_code"), str)
-        or not cause["cause_code"]
-        or not isinstance(cause.get("rank"), int)
-        or isinstance(cause.get("rank"), bool)
-        or not 1 <= cause["rank"] <= 5
-        for cause in ranked_causes
-    ):
-        return _policy_insufficient(case_id, base, supporting_refs, policy_ref)
     financial = base.get("financial_resolution", _empty_financial())
     policy_financial, has_policy_financial = _policy_financial(decision)
     if has_policy_financial:
@@ -878,6 +849,75 @@ def _policy_output(
     if status != "action_required" and (
         financial.get("recommended_refund_brl") != 0 or financial.get("refund_lines")
     ):
+        return _policy_insufficient(case_id, base, supporting_refs, policy_ref)
+    refund_action = any(
+        any(marker in action.lower() for marker in _REFUND_ACTION_MARKERS)
+        for action in actions
+    )
+    if refund_action and financial.get("recommended_refund_brl") == 0 and not financial.get(
+        "refund_lines"
+    ):
+        return _policy_insufficient(case_id, base, supporting_refs, policy_ref)
+
+    parties = decision.get(
+        "responsible_parties",
+        base["root_cause_analysis"].get("responsible_parties", []),
+    )
+    if not isinstance(parties, list) or len(parties) > 5:
+        return _policy_insufficient(case_id, base, supporting_refs, policy_ref)
+    seen_parties: set[tuple[str, str | None]] = set()
+    seller_ids = set(base["affected_entities"].get("seller_ids", []))
+    payment_refs = set(base["affected_entities"].get("payment_references", []))
+    shipment_ids = set(base["affected_entities"].get("shipment_ids", []))
+    for party in parties:
+        party_type = party.get("party_type") if isinstance(party, dict) else None
+        party_id = party.get("party_id") if isinstance(party, dict) else None
+        if (
+            not isinstance(party, dict)
+            or set(party) != {"party_type", "party_id"}
+            or party_type not in {
+                "seller",
+                "platform",
+                "logistics_provider",
+                "payment_provider",
+                "customer",
+                "unknown",
+            }
+            or not (isinstance(party_id, str) or party_id is None)
+            or isinstance(party_id, str) and not 1 <= len(party_id) <= 128
+        ):
+            return _policy_insufficient(case_id, base, supporting_refs, policy_ref)
+        identity = (party_type, party_id)
+        if identity in seen_parties:
+            return _policy_insufficient(case_id, base, supporting_refs, policy_ref)
+        seen_parties.add(identity)
+        in_scope = {
+            "seller": party_id in seller_ids,
+            "payment_provider": party_id in payment_refs,
+            "logistics_provider": party_id in shipment_ids,
+        }
+        if party_type in in_scope and not in_scope[party_type]:
+            return _policy_insufficient(case_id, base, supporting_refs, policy_ref)
+        if party_type in {"platform", "customer", "unknown"} and party_id is not None:
+            return _policy_insufficient(case_id, base, supporting_refs, policy_ref)
+
+    ranked_causes = decision.get(
+        "ranked_causes", base["root_cause_analysis"].get("ranked_causes", [])
+    )
+    if not isinstance(ranked_causes, list) or len(ranked_causes) > 5 or any(
+        not isinstance(cause, dict)
+        or set(cause) != {"cause_code", "rank"}
+        or not isinstance(cause.get("cause_code"), str)
+        or not re.fullmatch(r"[A-Z][A-Z0-9_]{2,79}", cause["cause_code"])
+        or not isinstance(cause.get("rank"), int)
+        or isinstance(cause.get("rank"), bool)
+        or not 1 <= cause["rank"] <= 5
+        for cause in ranked_causes
+    ):
+        return _policy_insufficient(case_id, base, supporting_refs, policy_ref)
+    causes = [cause["cause_code"] for cause in ranked_causes]
+    ranks = [cause["rank"] for cause in ranked_causes]
+    if len(causes) != len(set(causes)) or len(ranks) != len(set(ranks)):
         return _policy_insufficient(case_id, base, supporting_refs, policy_ref)
     result = {
         **base,
@@ -899,20 +939,97 @@ def _policy_output(
 
 
 def _verify_policy_result(
-    result: dict[str, Any], consumed_refs: list[str], policy_ref: str
+    result: dict[str, Any], consumed_refs: list[str], policy_ref: str | None
 ) -> None:
     refs = result.get("evidence_refs", [])
     if (
         not isinstance(refs, list)
         or len(refs) != len(set(refs))
         or not set(refs).issubset(consumed_refs)
-        or policy_ref not in refs
+        or (policy_ref is not None and policy_ref not in refs)
     ):
         raise ValueError("verifier: policy output evidence_refs are unsupported")
     status = result["assessment"]["case_status"]
     actions = result["resolution_actions"]
     if (status == "action_required") != bool(actions):
         raise ValueError("verifier: policy status is inconsistent with actions")
+
+
+def _policy_required(case: dict[str, Any]) -> bool:
+    return any(case.get(field) for field in _POLICY_REQUIRED_CASE_FIELDS)
+
+
+async def _finalize_policy(
+    *,
+    case_id: str,
+    order_id: str,
+    base: dict[str, Any],
+    gateway: EvidenceGateway,
+    trace: TraceWriter,
+    policy_tool: str | None,
+    required: bool,
+    consumed_refs: list[str],
+    supporting_refs: list[str],
+    authoritative_ids: set[str],
+) -> dict[str, Any]:
+    """Apply policy once for every workflow path and emit one decision event."""
+
+    if policy_tool is None and not required:
+        return base
+    policy_evidence: dict[str, Any] | None = None
+    failure_code = "policy_tool_unavailable"
+    if policy_tool is not None:
+        try:
+            policy_evidence = await _investigate_policy(
+                case_id, order_id, policy_tool, gateway, trace
+            )
+        except (RuntimeError, ValueError):
+            failure_code = "policy_evidence_unavailable"
+    if policy_evidence is None:
+        result = _policy_insufficient(case_id, base, supporting_refs)
+        trace.emit(
+            case_id=case_id,
+            event_type="policy_decided",
+            actor="policy-agent",
+            target="verifier",
+            decision_code=failure_code,
+            evidence_refs=result["evidence_refs"],
+        )
+        return result
+
+    policy_ref = policy_evidence["evidence_ref"]
+    if policy_ref in consumed_refs:
+        result = _policy_insufficient(case_id, base, supporting_refs)
+        decision_code = "policy_evidence_unavailable"
+    else:
+        policy_consumed_refs = [*consumed_refs, policy_ref]
+        result = _policy_output(
+            case_id,
+            base,
+            policy_evidence,
+            policy_consumed_refs,
+            supporting_refs,
+            authoritative_ids,
+        )
+        decision_code = (
+            "policy_applied"
+            if result["assessment"]["primary_issue"] != "insufficient_evidence"
+            else "insufficient_policy_evidence"
+        )
+    _verify_policy_result(
+        result,
+        [*consumed_refs, policy_ref],
+        policy_ref if policy_ref not in consumed_refs else None,
+    )
+    trace.emit(
+        case_id=case_id,
+        event_type="policy_decided",
+        actor="policy-agent",
+        target="verifier",
+        decision_code=decision_code,
+        evidence_refs=result["evidence_refs"],
+    )
+    return result
 
 
 async def _investigate_policy(
@@ -1179,6 +1296,7 @@ async def _solve_financial(
     trace: TraceWriter,
     tools: list[str],
     policy_tool: str | None = None,
+    policy_required: bool = False,
 ) -> dict[str, Any]:
     contracts = trace.contracts
     records: list[tuple[str, dict[str, Any]]] = []
@@ -1226,48 +1344,25 @@ async def _solve_financial(
             await investigate(domain, tool, actor)
     result = _financial_output(case_id, records, evidence_refs, order_id)
     _verify_financial(result, records, evidence_refs, order_id)
-    policy_evidence = None
-    if policy_tool is not None:
-        policy_evidence = await _investigate_policy(
-            case_id, order_id, policy_tool, gateway, trace
-        )
-        policy_ref = policy_evidence["evidence_ref"]
-        if policy_ref in evidence_refs:
-            raise ValueError("verifier: non-unique evidence ref")
-        consumed_refs = [*evidence_refs, policy_ref]
-        result = _policy_output(
-            case_id,
-            result,
-            policy_evidence,
-            consumed_refs,
-            evidence_refs,
-            _authoritative_entity_ids(records) or set(),
-        )
+    result = await _finalize_policy(
+        case_id=case_id,
+        order_id=order_id,
+        base=result,
+        gateway=gateway,
+        trace=trace,
+        policy_tool=policy_tool,
+        required=policy_required,
+        consumed_refs=evidence_refs,
+        supporting_refs=evidence_refs,
+        authoritative_ids=_authoritative_entity_ids(records) or set(),
+    )
     contracts.validate_output(result, f"output/{case_id}")
-    if policy_evidence is not None:
-        _verify_policy_result(
-            result,
-            [*evidence_refs, policy_evidence["evidence_ref"]],
-            policy_evidence["evidence_ref"],
-        )
-        trace.emit(
-            case_id=case_id,
-            event_type="policy_decided",
-            actor="policy-agent",
-            target="verifier",
-            decision_code=(
-                "policy_applied"
-                if result["assessment"]["primary_issue"] != "insufficient_evidence"
-                else "insufficient_policy_evidence"
-            ),
-            evidence_refs=result["evidence_refs"],
-        )
     trace.emit(
         case_id=case_id,
         event_type="verification_completed",
         actor="verifier",
         decision_code="output_contract_valid",
-        evidence_refs=evidence_refs,
+        evidence_refs=result["evidence_refs"],
     )
     return result
 
@@ -1278,6 +1373,7 @@ async def _solve_order_only(
     gateway: EvidenceGateway,
     trace: TraceWriter,
     policy_tool: str | None = None,
+    policy_required: bool = False,
 ) -> dict[str, Any]:
     """Isolated issue-1 compatibility path for gateways exposing only get_order."""
 
@@ -1316,45 +1412,26 @@ async def _solve_order_only(
     else:
         result = _output(case_id, evidence)
     _verify(result, evidence, order_id)
-    policy_evidence = None
     consumed_refs = [evidence_ref]
-    if policy_tool is not None:
-        policy_evidence = await _investigate_policy(
-            case_id, order_id, policy_tool, gateway, trace
-        )
-        policy_ref = policy_evidence["evidence_ref"]
-        if policy_ref in consumed_refs:
-            raise ValueError("verifier: non-unique evidence ref")
-        consumed_refs.append(policy_ref)
-        result = _policy_output(
-            case_id,
-            result,
-            policy_evidence,
-            consumed_refs,
-            [evidence_ref],
-            {order_id, *result["affected_entities"].get("item_ids", [])},
-        )
+    result = await _finalize_policy(
+        case_id=case_id,
+        order_id=order_id,
+        base=result,
+        gateway=gateway,
+        trace=trace,
+        policy_tool=policy_tool,
+        required=policy_required,
+        consumed_refs=consumed_refs,
+        supporting_refs=[evidence_ref],
+        authoritative_ids={order_id, *result["affected_entities"].get("item_ids", [])},
+    )
     contracts.validate_output(result, f"output/{case_id}")
-    if policy_evidence is not None:
-        _verify_policy_result(result, consumed_refs, policy_evidence["evidence_ref"])
-        trace.emit(
-            case_id=case_id,
-            event_type="policy_decided",
-            actor="policy-agent",
-            target="verifier",
-            decision_code=(
-                "policy_applied"
-                if result["assessment"]["primary_issue"] != "insufficient_evidence"
-                else "insufficient_policy_evidence"
-            ),
-            evidence_refs=result["evidence_refs"],
-        )
     trace.emit(
         case_id=case_id,
         event_type="verification_completed",
         actor="verifier",
         decision_code="output_contract_valid",
-        evidence_refs=[evidence_ref],
+        evidence_refs=result["evidence_refs"],
     )
     return result
 
@@ -1375,7 +1452,13 @@ async def solve_case(
     policy_tool = _policy_tool(tools)
     if _requested_financial(case):
         return await _solve_financial(
-            case_id, order_id, gateway, trace, tools, policy_tool
+            case_id,
+            order_id,
+            gateway,
+            trace,
+            tools,
+            policy_tool,
+            _policy_required(case),
         )
 
     # Keep the issue-1 path contract-compatible for a gateway that only exposes
@@ -1388,7 +1471,12 @@ async def solve_case(
     }
     if not specialist_tools:
         return await _solve_order_only(
-            case_id, order_id, gateway, trace, policy_tool
+            case_id,
+            order_id,
+            gateway,
+            trace,
+            policy_tool,
+            _policy_required(case),
         )
 
     if any(name in specialist_tools for name in ("get_order_items", "get_sellers")):
@@ -1498,50 +1586,27 @@ async def solve_case(
         order_id,
         consumed_refs,
     )
-    policy_evidence = None
-    if policy_tool is not None:
-        policy_evidence = await _investigate_policy(
-            case_id, order_id, policy_tool, gateway, trace
-        )
-        policy_ref = policy_evidence["evidence_ref"]
-        if policy_ref in consumed_refs:
-            raise ValueError("verifier: non-unique evidence ref")
-        policy_consumed_refs = [*consumed_refs, policy_ref]
-        authoritative_ids = {order_id}
-        for key in ("item_ids", "payment_references", "seller_ids", "shipment_ids"):
-            authoritative_ids.update(result["affected_entities"].get(key, []))
-        result = _policy_output(
-            case_id,
-            result,
-            policy_evidence,
-            policy_consumed_refs,
-            _entity_supporting_refs(evidence_items, result),
-            authoritative_ids,
-        )
+    authoritative_ids = {order_id}
+    for key in ("item_ids", "payment_references", "seller_ids", "shipment_ids"):
+        authoritative_ids.update(result["affected_entities"].get(key, []))
+    result = await _finalize_policy(
+        case_id=case_id,
+        order_id=order_id,
+        base=result,
+        gateway=gateway,
+        trace=trace,
+        policy_tool=policy_tool,
+        required=_policy_required(case),
+        consumed_refs=consumed_refs,
+        supporting_refs=_entity_supporting_refs(evidence_items, result),
+        authoritative_ids=authoritative_ids,
+    )
     contracts.validate_output(result, f"output/{case_id}")
-    if policy_evidence is not None:
-        _verify_policy_result(
-            result,
-            [*consumed_refs, policy_evidence["evidence_ref"]],
-            policy_evidence["evidence_ref"],
-        )
-        trace.emit(
-            case_id=case_id,
-            event_type="policy_decided",
-            actor="policy-agent",
-            target="verifier",
-            decision_code=(
-                "policy_applied"
-                if result["assessment"]["primary_issue"] != "insufficient_evidence"
-                else "insufficient_policy_evidence"
-            ),
-            evidence_refs=result["evidence_refs"],
-        )
     trace.emit(
         case_id=case_id,
         event_type="verification_completed",
         actor="verifier",
         decision_code="output_contract_valid",
-        evidence_refs=consumed_refs,
+        evidence_refs=result["evidence_refs"],
     )
     return result

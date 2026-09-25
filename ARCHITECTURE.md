@@ -19,6 +19,9 @@ use the entity slice; payment/refund cases use the financial slice, which
 requires payment and refund evidence before it can finalize. When a policy tool
 is advertised, the policy specialist consumes the verified slice and its
 validated `policy` envelope to produce the final issue/status/action decision.
+Cases carrying `policy_version` require this step; an unavailable tool or
+evidence yields a visible insufficient-evidence result and `policy_decided`
+trace event rather than retaining a pre-policy decision.
 The CLI emits `case_received` and `case_finalized`; `solve_case` emits
 assignments, per-result consumption, handoffs, and verification events between
 them. The input's customer message supplies only lookup and claim identifiers;

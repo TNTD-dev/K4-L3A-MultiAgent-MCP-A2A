@@ -828,7 +828,7 @@ def test_slice_marks_payment_claim_insufficient_without_payment_evidence(tmp_pat
     ("status", "issue", "actions"),
     [
         ("action_required", "canceled_order_paid", ["issue_refund"]),
-        ("no_action", "valid_split_payment", []),
+        ("no_action", "canceled_order_paid", []),
         ("needs_investigation", "insufficient_evidence", []),
     ],
 )
@@ -836,7 +836,10 @@ def test_policy_decision_paths_are_consistent(
     tmp_path: Path, status: str, issue: str, actions: list[str]
 ) -> None:
     policy = _policy_evidence(issue=issue, status=status, actions=actions)
-    gateway = PolicyGateway(_evidence(), policy)
+    order = _evidence()
+    if status == "no_action":
+        order["data"]["primary_issue"] = issue
+    gateway = PolicyGateway(order, policy)
     contracts = _contracts()
     trace_path = tmp_path / "trace.jsonl"
     trace = TraceWriter(trace_path, contracts)
@@ -882,3 +885,135 @@ def test_inconclusive_policy_fails_closed_and_keeps_policy_trace(tmp_path: Path)
     }
     assert output["resolution_actions"] == []
     assert policy["evidence_ref"] in output["evidence_refs"]
+
+
+def test_required_policy_tool_missing_fails_closed_with_trace(tmp_path: Path) -> None:
+    contracts = _contracts()
+    trace_path = tmp_path / "trace.jsonl"
+    output = asyncio.run(
+        solve_case(
+            {
+                "case_id": "CASE_001",
+                "order_id": "order-1",
+                "policy_version": "EC_POLICY_V1",
+            },
+            StubGateway(_evidence()),
+            TraceWriter(trace_path, contracts),
+        )
+    )
+
+    assert output["assessment"] == {
+        "primary_issue": "insufficient_evidence",
+        "case_status": "needs_investigation",
+        "confidence": 0.0,
+    }
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    policy_events = [event for event in events if event["event_type"] == "policy_decided"]
+    assert policy_events[0]["decision_code"] == "policy_tool_unavailable"
+    contracts.validate_trace(policy_events[0], "missing policy trace")
+
+
+def test_required_policy_missing_is_visible_in_entity_and_financial_paths(
+    tmp_path: Path,
+) -> None:
+    entity_gateway = SliceGateway(_slice_evidence("seller", case_tag="011"))
+    entity_trace_path = tmp_path / "entity-trace.jsonl"
+    entity = asyncio.run(
+        solve_case(
+            {
+                "case_id": "CASE_011",
+                "customer_request": {
+                    "claimed_order_id": "order-1",
+                    "claims": [{"claim_id": "c", "topic": "late_delivery_seller"}],
+                },
+                "policy_version": "EC_POLICY_V1",
+            },
+            entity_gateway,
+            TraceWriter(entity_trace_path, _contracts()),
+        )
+    )
+    assert entity["assessment"]["primary_issue"] == "insufficient_evidence"
+    assert any(
+        json.loads(line)["event_type"] == "policy_decided"
+        for line in entity_trace_path.read_text().splitlines()
+    )
+
+    order = _evidence()
+    payment = _specialist_evidence("payment", "m")
+    refund = _specialist_evidence("refund", "r")
+    financial_trace_path = tmp_path / "financial-trace.jsonl"
+    financial = asyncio.run(
+        solve_case(
+            {
+                "case_id": "CASE_012",
+                "order_id": "order-1",
+                "policy_version": "EC_POLICY_V1",
+                "customer_request": {"claims": [{"topic": "payment_mismatch"}]},
+            },
+            PaymentRefundGateway(order, payment, refund),
+            TraceWriter(financial_trace_path, _contracts()),
+        )
+    )
+    assert financial["assessment"]["primary_issue"] == "insufficient_evidence"
+    assert any(
+        json.loads(line)["event_type"] == "policy_decided"
+        for line in financial_trace_path.read_text().splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda data: data.update({"primary_issue": "late_delivery_seller"}),
+        lambda data: data.update(
+            {
+                "responsible_parties": [
+                    {"party_type": "seller", "party_id": "not-authoritative"}
+                ]
+            }
+        ),
+        lambda data: data.update(
+            {"allowed_actions": ["issue_refund"], "resolution_actions": ["not-allowed"]}
+        ),
+        lambda data: data.update(
+            {
+                "recommended_refund_brl": 0,
+                "refund_lines": [],
+                "resolution_actions": ["issue_refund"],
+            }
+        ),
+        lambda data: data.update(
+            {
+                "ranked_causes": [
+                    {"cause_code": "bad-code", "rank": 1, "extra": "reject"}
+                ]
+            }
+        ),
+        lambda data: data.update(
+            {
+                "responsible_parties": [
+                    {"party_type": "platform", "party_id": None, "extra": "reject"}
+                ]
+            }
+        ),
+    ],
+)
+def test_policy_mismatch_or_malformed_data_fails_closed(
+    tmp_path: Path, mutate: Any
+) -> None:
+    policy = _policy_evidence()
+    mutate(policy["data"])
+    gateway = PolicyGateway(_evidence(), policy)
+    output = asyncio.run(
+        solve_case(
+            {"case_id": "CASE_001", "order_id": "order-1"},
+            gateway,
+            TraceWriter(tmp_path / "trace.jsonl", _contracts()),
+        )
+    )
+    assert output["assessment"] == {
+        "primary_issue": "insufficient_evidence",
+        "case_status": "needs_investigation",
+        "confidence": 0.0,
+    }
+    assert output["resolution_actions"] == []
