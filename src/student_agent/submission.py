@@ -83,7 +83,86 @@ def validate_artifacts(
     serialized = [json.dumps(value, ensure_ascii=False) for value in outputs.values()]
     if SECRET_PATTERN.search("\n".join([*serialized, *normalized_lines])):
         raise ValueError("a Team API Key appears in output or trace")
+
+    _validate_trace_lifecycle(outputs, trace_lines, expected)
     return outputs, normalized_lines
+
+
+def _validate_trace_lifecycle(
+    outputs: dict[str, dict[str, Any]], trace_lines: list[str], expected: set[str]
+) -> None:
+    """Enforce the public receive-to-finalize workflow and provenance links."""
+
+    events_by_case: dict[str, list[dict[str, Any]]] = {case_id: [] for case_id in expected}
+    for line in trace_lines:
+        event = json.loads(line)
+        # Prompt text and hidden reasoning do not belong in an observable
+        # public trace, including nested attribute objects.
+        suspicious = {"prompt", "prompts", "cot", "chain_of_thought", "reasoning", "thoughts"}
+        if any(key.lower() in suspicious for key in event):
+            raise ValueError("trace contains prompt or chain-of-thought content")
+        attributes = event.get("attributes")
+        if isinstance(attributes, dict) and any(
+            key.lower() in suspicious for key in attributes
+        ):
+            raise ValueError("trace attributes contain prompt or chain-of-thought content")
+        events_by_case[event["case_id"]].append(event)
+
+    required = {
+        "case_received",
+        "task_assigned",
+        "handoff",
+        "verification_completed",
+        "case_finalized",
+    }
+    for case_id in expected:
+        events = events_by_case[case_id]
+        event_types = [event["event_type"] for event in events]
+        missing = required - set(event_types)
+        if missing:
+            raise ValueError(f"trace for {case_id} is missing lifecycle events: {sorted(missing)}")
+        positions = {event_type: event_types.index(event_type) for event_type in required}
+        if positions["case_received"] != 0 or positions["case_finalized"] != len(events) - 1:
+            raise ValueError(f"trace for {case_id} does not span receive-to-finalize")
+        if not (
+            positions["case_received"]
+            < positions["task_assigned"]
+            < positions["handoff"]
+            < positions["verification_completed"]
+            < positions["case_finalized"]
+        ):
+            raise ValueError(f"trace for {case_id} has invalid lifecycle ordering")
+        if not any(
+            event["event_type"] == "task_assigned"
+            and event.get("actor") == "coordinator"
+            and event.get("target")
+            and event.get("target") != "coordinator"
+            for event in events
+        ):
+            raise ValueError(f"trace for {case_id} has no specialist assignment")
+        if not any(
+            event["event_type"] == "handoff" and event.get("actor") != "coordinator"
+            for event in events
+        ):
+            raise ValueError(f"trace for {case_id} has no specialist handoff")
+
+        consumed_refs = {
+            ref
+            for event in events
+            if event["event_type"] == "tool_result_consumed"
+            for ref in event.get("evidence_refs", [])
+        }
+        consumed_events = [
+            event for event in events if event["event_type"] == "tool_result_consumed"
+        ]
+        if any(
+            not event.get("tool_name") or not event.get("evidence_refs")
+            for event in consumed_events
+        ):
+            raise ValueError(f"trace for {case_id} has an unlinked tool result")
+        submitted_refs = set(outputs[case_id].get("evidence_refs", []))
+        if not submitted_refs.issubset(consumed_refs):
+            raise ValueError(f"trace for {case_id} does not link all submitted evidence")
 
 
 def package_submission(root: Path, destination: Path) -> Path:

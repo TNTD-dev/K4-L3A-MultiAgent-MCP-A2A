@@ -452,6 +452,28 @@ def test_refund_money_reconciliation_uses_decimal_values(tmp_path: Path) -> None
     ) == Decimal("0.3")
 
 
+def test_conflicting_financial_decisions_are_explicitly_recorded(tmp_path: Path) -> None:
+    order = _evidence()
+    payment = _specialist_evidence("payment", "p", "payment_mismatch")
+    refund = _specialist_evidence("refund", "r", "refund_pending")
+    output = asyncio.run(
+        solve_case(
+            {
+                "case_id": "CASE_001",
+                "order_id": "order-1",
+                "customer_request": {"claims": [{"topic": "payment_mismatch"}]},
+            },
+            PaymentRefundGateway(order, payment, refund),
+            TraceWriter(tmp_path / "trace.jsonl", _contracts()),
+        )
+    )
+    assert output["assessment"]["primary_issue"] == "insufficient_evidence"
+    assert output["data_conflicts"][0]["resolution_code"] == (
+        "conflicting_financial_decisions"
+    )
+    assert output["data_conflicts"][0]["selected_source"] is None
+
+
 def test_cli_run_writes_and_validates_end_to_end(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1017,3 +1039,63 @@ def test_policy_mismatch_or_malformed_data_fails_closed(
         "confidence": 0.0,
     }
     assert output["resolution_actions"] == []
+
+
+def test_specialist_timeout_is_bounded_once_and_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import student_agent.workflow as workflow
+
+    evidence = _slice_evidence("seller", case_tag="012")
+
+    class TimeoutGateway(SliceGateway):
+        async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+            self.calls.append((tool_name, case_id, arguments))
+            if tool_name == "get_shipment_summary":
+                await asyncio.sleep(0.05)
+                return self.evidence[tool_name]
+            self.calls.pop()
+            return await super().call(tool_name, case_id=case_id, **arguments)
+
+    monkeypatch.setattr(workflow, "_MCP_CALL_TIMEOUT_SECONDS", 0.001)
+    gateway = TimeoutGateway(evidence)
+    trace_path = tmp_path / "trace.jsonl"
+    output = asyncio.run(
+        solve_case(
+            {
+                "case_id": "CASE_012",
+                "customer_request": {
+                    "claimed_order_id": "order-1",
+                    "claims": [{"claim_id": "c", "topic": "late_delivery_seller"}],
+                },
+            },
+            gateway,
+            TraceWriter(trace_path, _contracts()),
+        )
+    )
+    assert output["assessment"]["primary_issue"] == "insufficient_evidence"
+    assert [call[0] for call in gateway.calls].count("get_shipment_summary") == 1
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert events[-1]["decision_code"] == "mcp_timeout"
+
+
+def test_cross_case_seller_rows_are_not_authoritative(tmp_path: Path) -> None:
+    evidence = _slice_evidence("seller", case_tag="013")
+    evidence["get_sellers"]["data"].append(
+        {"order_id": "order-2", "seller_id": "seller-cross-case"}
+    )
+    output = asyncio.run(
+        solve_case(
+            {
+                "case_id": "CASE_013",
+                "customer_request": {
+                    "claimed_order_id": "order-1",
+                    "claims": [{"claim_id": "c", "topic": "late_delivery_seller"}],
+                },
+            },
+            SliceGateway(evidence),
+            TraceWriter(tmp_path / "trace.jsonl", _contracts()),
+        )
+    )
+    assert output["assessment"]["primary_issue"] == "insufficient_evidence"
+    assert "seller-cross-case" not in output["affected_entities"]["seller_ids"]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from decimal import Decimal, InvalidOperation
 from math import isfinite
@@ -31,6 +32,48 @@ _POLICY_TOOL_PREFERENCE = (
 )
 _POLICY_REQUIRED_CASE_FIELDS = ("policy_version",)
 _REFUND_ACTION_MARKERS = ("refund", "reimburse", "repay")
+# Calls are deliberately single-attempt.  A retry could duplicate an audited
+# MCP call and, more importantly, make a late result race the verifier.  The
+# short bound keeps a broken gateway from holding a case open indefinitely.
+_MCP_CALL_TIMEOUT_SECONDS = 5.0
+
+
+async def _call_gateway(
+    gateway: EvidenceGateway,
+    tool_name: str,
+    *,
+    case_id: str,
+    order_id: str,
+) -> dict[str, Any]:
+    """Make one bounded, idempotent MCP request.
+
+    ``wait_for`` also works with the small async gateway stubs used by the
+    workflow tests.  No retry is performed: every server call is audited and
+    repeating a non-idempotent or timed-out request would make provenance
+    ambiguous.
+    """
+
+    try:
+        result = await asyncio.wait_for(
+            gateway.call(tool_name, case_id=case_id, order_id=order_id),
+            timeout=_MCP_CALL_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as exc:
+        raise RuntimeError(f"MCP tool {tool_name} timed out") from exc
+    if not isinstance(result, dict):
+        raise ValueError(f"MCP tool {tool_name} returned a non-object result")
+    return result
+
+
+def _failure_decision_code(error: BaseException) -> str:
+    """Map gateway failures to compact public decision codes."""
+
+    message = str(error).lower()
+    if "timed out" in message or "timeout" in message:
+        return "mcp_timeout"
+    if "not found" in message or "not_found" in message:
+        return "mcp_not_found"
+    return "mcp_failure"
 
 
 def _empty_financial() -> dict[str, Any]:
@@ -314,7 +357,17 @@ def _entity_ids(
             valid = False
             continue
         row_order_id = row.get("order_id")
-        if row_order_id is not None and row_order_id != requested_order_id:
+        # Item rows must carry their owning order.  Seller registries in the
+        # public gateway may omit it, but an explicitly supplied scope must
+        # always match; seller linkage is checked against item rows below.
+        if expected_domain == "item" and row_order_id != requested_order_id:
+            valid = False
+            continue
+        if (
+            expected_domain != "item"
+            and row_order_id is not None
+            and row_order_id != requested_order_id
+        ):
             valid = False
             continue
         value = row.get(key)
@@ -348,6 +401,8 @@ def _shipment_ids(
                 values.extend(value)
         else:
             values.append(value)
+    if data_order_id is None and values:
+        valid = False
     events = data.get("events", [])
     if events is not None:
         if not isinstance(events, list):
@@ -361,6 +416,8 @@ def _shipment_ids(
                 if event_order_id not in (None, requested_order_id):
                     valid = False
                     continue
+                if event_order_id is None and event.get("shipment_id") is not None:
+                    valid = False
                 if event.get("shipment_id") is not None:
                     values.append(event["shipment_id"])
     ids, ids_valid = _unique_ids(values)
@@ -385,7 +442,11 @@ def _late_actors(
         if not isinstance(event, dict):
             valid = False
             continue
-        if event.get("order_id") not in (None, requested_order_id):
+        event_order_id = event.get("order_id")
+        if event_order_id not in (None, requested_order_id):
+            continue
+        if event_order_id is None:
+            valid = False
             continue
         event_type = event.get("event_type")
         status = event.get("status")
@@ -419,6 +480,27 @@ def _claims(case: dict[str, Any]) -> list[tuple[str, str]]:
         if isinstance(claim_id, str) and claim_id and isinstance(topic, str) and topic:
             result.append((claim_id, topic))
     return result
+
+
+def _has_invalid_claim(case: dict[str, Any]) -> bool:
+    """Detect malformed or unsupported customer hypotheses before finalization."""
+
+    request = case.get("customer_request")
+    if not isinstance(request, dict) or request.get("claims") is None:
+        return False
+    claims = request.get("claims")
+    if not isinstance(claims, list):
+        return True
+    supported_topics = _ISSUES | {"requested_full_refund"}
+    for claim in claims:
+        if not isinstance(claim, dict):
+            return True
+        claim_id, topic = claim.get("claim_id"), claim.get("topic")
+        if claim_id is not None and (not isinstance(claim_id, str) or not claim_id):
+            return True
+        if not isinstance(topic, str) or not topic or topic not in supported_topics:
+            return True
+    return False
 
 
 def _claim_assessments(
@@ -494,11 +576,17 @@ def _slice_output(
         if shipment_evidence
         else ([], False)
     )
-    # Seller records are the authoritative seller source. Item rows can add a
-    # seller only when the seller tool is unavailable, but never create one.
-    if not seller_ids and item_sellers_valid:
-        seller_ids = item_seller_ids
-    seller_ids = list(dict.fromkeys([*seller_ids, *item_seller_ids]))
+    # A seller registry row has no order identity in some gateway versions;
+    # item linkage is therefore the authority for the seller IDs we retain.
+    # Never let an unrelated seller row become an affected entity.
+    if item_evidence is None:
+        seller_ids = []
+        sellers_valid = False
+    else:
+        linked_sellers = set(item_seller_ids)
+        if any(seller_id not in linked_sellers for seller_id in seller_ids):
+            sellers_valid = False
+        seller_ids = list(dict.fromkeys([*seller_ids, *item_seller_ids]))
     late_actors, late_events_valid = (
         _late_actors(shipment_evidence, requested_order_id)
         if shipment_evidence
@@ -599,11 +687,14 @@ def _verify_slice(
 ) -> None:
     """Verify scope, immutable references, and uniqueness for the four domains."""
 
-    if (
-        order_evidence["domain"] != "order"
-        or order_evidence["data"].get("order_id") != requested_order_id
-    ):
+    if not _evidence_in_scope(order_evidence, "order", requested_order_id):
         raise ValueError("verifier: order evidence is outside the requested scope")
+    for evidence in auxiliary:
+        if (
+            not _evidence_in_scope(evidence, evidence.get("domain"), requested_order_id)
+            and result["assessment"]["primary_issue"] != "insufficient_evidence"
+        ):
+            raise ValueError("verifier: specialist evidence is outside the requested scope")
     refs = [evidence["evidence_ref"] for evidence in [order_evidence, *auxiliary]]
     if refs != consumed_refs or len(refs) != len(set(refs)):
         raise ValueError("verifier: consumed evidence references changed or repeated")
@@ -616,6 +707,65 @@ def _verify_slice(
             raise ValueError(f"verifier: duplicate {key}")
     if entities["order_ids"] != [requested_order_id]:
         raise ValueError("verifier: output order is outside the requested scope")
+
+
+def _evidence_in_scope(
+    evidence: dict[str, Any], expected_domain: str | None, requested_order_id: str
+) -> bool:
+    """Reject envelopes whose entity rows cannot be tied to this order.
+
+    The evidence contract intentionally leaves ``data`` open because each MCP
+    domain has a different shape.  This verifier-level check is therefore the
+    boundary that prevents a valid envelope from smuggling in cross-case IDs.
+    """
+
+    if evidence.get("domain") != expected_domain:
+        return False
+    data = evidence.get("data")
+    if expected_domain == "order":
+        return isinstance(data, dict) and data.get("order_id") == requested_order_id
+    if expected_domain in {"payment", "refund", "policy"}:
+        return isinstance(data, dict) and data.get("order_id") == requested_order_id
+    if expected_domain == "item":
+        if not isinstance(data, list):
+            return False
+        return all(
+            isinstance(row, dict)
+            and row.get("order_id") == requested_order_id
+            and isinstance(row.get("order_item_id"), str)
+            and bool(row["order_item_id"])
+            for row in data
+        )
+    if expected_domain == "seller":
+        if not isinstance(data, list):
+            return False
+        return all(
+            isinstance(row, dict)
+            and isinstance(row.get("seller_id"), str)
+            and bool(row["seller_id"])
+            and (row.get("order_id") is None or row.get("order_id") == requested_order_id)
+            for row in data
+        )
+    if expected_domain == "shipment":
+        if not isinstance(data, dict):
+            return False
+        if data.get("order_id") not in (None, requested_order_id):
+            return False
+        events = data.get("events", [])
+        if not isinstance(events, list):
+            return False
+        # An unscoped summary is acceptable only when it contains no entity or
+        # event facts.  Any returned shipment/event must carry the order scope.
+        if data.get("order_id") is None and any(
+            data.get(key) is not None for key in ("shipment_id", "shipment_ids")
+        ):
+            return False
+        return all(
+            isinstance(event, dict)
+            and event.get("order_id") == requested_order_id
+            for event in events
+        )
+    return False
 
 
 def _entity_supporting_refs(
@@ -955,6 +1105,116 @@ def _verify_policy_result(
         raise ValueError("verifier: policy status is inconsistent with actions")
 
 
+def _verify_result_invariants(result: dict[str, Any], consumed_refs: list[str]) -> None:
+    """Validate semantic invariants shared by every workflow slice.
+
+    The JSON schema validates shape, while this function validates the
+    relationships that determine whether a result is safe to submit.
+    """
+
+    refs = result.get("evidence_refs")
+    if not isinstance(refs, list) or len(refs) != len(set(refs)):
+        raise ValueError("verifier: evidence references are not unique")
+    if not set(refs).issubset(consumed_refs):
+        raise ValueError("verifier: output evidence references were not consumed")
+
+    assessment = result["assessment"]
+    issue = assessment["primary_issue"]
+    status = assessment["case_status"]
+    confidence = assessment["confidence"]
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        raise ValueError("verifier: confidence is not numeric")
+    if not isfinite(float(confidence)) or not 0 <= confidence <= 1:
+        raise ValueError("verifier: confidence is outside [0, 1]")
+    actions = result["resolution_actions"]
+    if (status == "action_required") != bool(actions):
+        raise ValueError("verifier: status is inconsistent with actions")
+    if issue == "insufficient_evidence" and status != "needs_investigation":
+        raise ValueError("verifier: insufficient evidence must need investigation")
+    if issue == "insufficient_evidence" and confidence != 0:
+        raise ValueError("verifier: insufficient evidence cannot have confidence")
+
+    entities = result["affected_entities"]
+    entity_sets: dict[str, set[str]] = {}
+    for key in (
+        "order_ids",
+        "item_ids",
+        "seller_ids",
+        "payment_references",
+        "shipment_ids",
+    ):
+        values = entities[key]
+        if len(values) != len(set(values)):
+            raise ValueError(f"verifier: duplicate {key}")
+        entity_sets[key] = set(values)
+
+    financial = result["financial_resolution"]
+    total = _money(financial["recommended_refund_brl"], "output refund total")
+    line_total = Decimal("0")
+    for line in financial["refund_lines"]:
+        entity_id = line["entity_id"]
+        if entity_id is not None and not any(
+            entity_id in values
+            for values in entity_sets.values()
+        ):
+            raise ValueError("verifier: refund line entity is outside affected entities")
+        line_total += _money(line["amount_brl"], "output refund line")
+    if total != line_total:
+        raise ValueError("verifier: financial total does not equal refund-line sum")
+    refund_action = any(
+        any(marker in action.lower() for marker in _REFUND_ACTION_MARKERS)
+        for action in actions
+    )
+    if refund_action and total == 0 and not financial["refund_lines"]:
+        raise ValueError("verifier: refund action has no refundable amount")
+    if status != "action_required" and (total != 0 or financial["refund_lines"]):
+        raise ValueError("verifier: non-action result contains a refund")
+
+    causes = result["root_cause_analysis"]["ranked_causes"]
+    cause_codes = [cause["cause_code"] for cause in causes]
+    ranks = [cause["rank"] for cause in causes]
+    if len(cause_codes) != len(set(cause_codes)) or len(ranks) != len(set(ranks)):
+        raise ValueError("verifier: duplicate root-cause code or rank")
+    parties = result["root_cause_analysis"]["responsible_parties"]
+    seen_parties: set[tuple[str, str | None]] = set()
+    for party in parties:
+        identity = (party["party_type"], party["party_id"])
+        if identity in seen_parties:
+            raise ValueError("verifier: duplicate responsible party")
+        seen_parties.add(identity)
+        party_type, party_id = identity
+        if party_id is not None:
+            allowed = {
+                "seller": entity_sets["seller_ids"],
+                "payment_provider": entity_sets["payment_references"],
+                "logistics_provider": entity_sets["shipment_ids"],
+            }.get(party_type)
+            if allowed is not None and party_id not in allowed:
+                raise ValueError("verifier: responsible party is outside affected entities")
+
+    claims = result.get("claim_assessments", [])
+    claim_ids: set[str] = set()
+    for claim in claims:
+        claim_id = claim["claim_id"]
+        if claim_id in claim_ids:
+            raise ValueError("verifier: duplicate claim assessment")
+        claim_ids.add(claim_id)
+        claim_confidence = claim["confidence"]
+        if not isfinite(float(claim_confidence)) or not 0 <= claim_confidence <= 1:
+            raise ValueError("verifier: claim confidence is outside [0, 1]")
+        claim_refs = claim["evidence_refs"]
+        if not set(claim_refs).issubset(consumed_refs):
+            raise ValueError("verifier: claim cites unconsumed evidence")
+
+    for conflict in result["data_conflicts"]:
+        sources = conflict["sources"]
+        selected = conflict["selected_source"]
+        if len(sources) < 2 or len(sources) != len(set(sources)):
+            raise ValueError("verifier: invalid data conflict sources")
+        if selected is not None and selected not in sources:
+            raise ValueError("verifier: selected conflict source is not listed")
+
+
 def _policy_required(case: dict[str, Any]) -> bool:
     return any(case.get(field) for field in _POLICY_REQUIRED_CASE_FIELDS)
 
@@ -983,7 +1243,9 @@ async def _finalize_policy(
             policy_evidence = await _investigate_policy(
                 case_id, order_id, policy_tool, gateway, trace
             )
-        except (RuntimeError, ValueError):
+        except RuntimeError as exc:
+            failure_code = _failure_decision_code(exc)
+        except ValueError:
             failure_code = "policy_evidence_unavailable"
     if policy_evidence is None:
         result = _policy_insufficient(case_id, base, supporting_refs)
@@ -1049,7 +1311,9 @@ async def _investigate_policy(
         target="policy-agent",
         decision_code="policy_lookup",
     )
-    evidence = await gateway.call(policy_tool, case_id=case_id, order_id=order_id)
+    evidence = await _call_gateway(
+        gateway, policy_tool, case_id=case_id, order_id=order_id
+    )
     contracts.validate_evidence(evidence, f"MCP tool {policy_tool}")
     if evidence.get("domain") != "policy":
         raise ValueError(f"MCP {policy_tool} did not return policy evidence")
@@ -1077,7 +1341,10 @@ async def _investigate_policy(
 
 
 def _financial_insufficient(
-    case_id: str, order_id: str, evidence_refs: list[str]
+    case_id: str,
+    order_id: str,
+    evidence_refs: list[str],
+    data_conflicts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": "day09-l3a-output-v2",
@@ -1096,7 +1363,7 @@ def _financial_insufficient(
         },
         "root_cause_analysis": {"ranked_causes": [], "responsible_parties": []},
         "evidence_refs": list(dict.fromkeys(evidence_refs)),
-        "data_conflicts": [],
+        "data_conflicts": data_conflicts or [],
         "financial_resolution": _empty_financial(),
         "resolution_actions": [],
     }
@@ -1202,7 +1469,19 @@ def _financial_output(
         if issue is not None:
             decisions.append(issue)
     if len(decisions) != 1:
-        return _financial_insufficient(case_id, requested_order_id, evidence_refs)
+        conflicts = None
+        if len(decisions) > 1:
+            conflicts = [
+                {
+                    "field": "financial_primary_issue",
+                    "sources": ["payment:primary_issue", "refund:primary_issue"],
+                    "selected_source": None,
+                    "resolution_code": "conflicting_financial_decisions",
+                }
+            ]
+        return _financial_insufficient(
+            case_id, requested_order_id, evidence_refs, conflicts
+        )
     issue = decisions[0]
     decision_data = payment_records[0] if issue in _PAYMENT_ISSUES else refund_records[0]
     status = decision_data.get("case_status")
@@ -1297,10 +1576,12 @@ async def _solve_financial(
     tools: list[str],
     policy_tool: str | None = None,
     policy_required: bool = False,
+    invalid_claim: bool = False,
 ) -> dict[str, Any]:
     contracts = trace.contracts
     records: list[tuple[str, dict[str, Any]]] = []
     evidence_refs: list[str] = []
+    failure_codes: list[str] = []
 
     async def investigate(domain: str, tool_name: str, actor: str) -> None:
         trace.emit(
@@ -1310,7 +1591,9 @@ async def _solve_financial(
             target=actor,
             decision_code=f"{domain}_lookup",
         )
-        evidence = await gateway.call(tool_name, case_id=case_id, order_id=order_id)
+        evidence = await _call_gateway(
+            gateway, tool_name, case_id=case_id, order_id=order_id
+        )
         contracts.validate_evidence(evidence, f"MCP tool {tool_name}")
         data = evidence.get("data")
         if evidence.get("domain") != domain or not isinstance(data, dict):
@@ -1318,9 +1601,10 @@ async def _solve_financial(
         if data.get("order_id") != order_id:
             raise ValueError(f"MCP {tool_name} returned evidence for a different order")
         ref = evidence["evidence_ref"]
-        if ref not in evidence_refs:
-            evidence_refs.append(ref)
-            records.append((domain, data))
+        if ref in evidence_refs:
+            raise ValueError("verifier: evidence reference is non-unique")
+        evidence_refs.append(ref)
+        records.append((domain, data))
         trace.emit(
             case_id=case_id,
             event_type="tool_result_consumed",
@@ -1341,8 +1625,17 @@ async def _solve_financial(
     for domain, actor in (("payment", "payment-agent"), ("refund", "refund-agent")):
         tool = _financial_tool(tools, domain)
         if tool is not None:
-            await investigate(domain, tool, actor)
+            # A specialist failure is a bounded, fail-closed outcome.  The
+            # order envelope remains usable for correlation, but no missing
+            # payment/refund fact is inferred from it.
+            try:
+                await investigate(domain, tool, actor)
+            except RuntimeError as exc:
+                failure_codes.append(_failure_decision_code(exc))
+                continue
     result = _financial_output(case_id, records, evidence_refs, order_id)
+    if invalid_claim:
+        result = _financial_insufficient(case_id, order_id, evidence_refs)
     _verify_financial(result, records, evidence_refs, order_id)
     result = await _finalize_policy(
         case_id=case_id,
@@ -1356,12 +1649,15 @@ async def _solve_financial(
         supporting_refs=evidence_refs,
         authoritative_ids=_authoritative_entity_ids(records) or set(),
     )
+    _verify_result_invariants(result, evidence_refs + [
+        ref for ref in result["evidence_refs"] if ref not in evidence_refs
+    ])
     contracts.validate_output(result, f"output/{case_id}")
     trace.emit(
         case_id=case_id,
         event_type="verification_completed",
         actor="verifier",
-        decision_code="output_contract_valid",
+        decision_code=failure_codes[0] if failure_codes else "output_contract_valid",
         evidence_refs=result["evidence_refs"],
     )
     return result
@@ -1374,6 +1670,7 @@ async def _solve_order_only(
     trace: TraceWriter,
     policy_tool: str | None = None,
     policy_required: bool = False,
+    invalid_claim: bool = False,
 ) -> dict[str, Any]:
     """Isolated issue-1 compatibility path for gateways exposing only get_order."""
 
@@ -1385,7 +1682,9 @@ async def _solve_order_only(
         target="order-agent",
         decision_code="order_lookup",
     )
-    evidence = await gateway.call("get_order", case_id=case_id, order_id=order_id)
+    evidence = await _call_gateway(
+        gateway, "get_order", case_id=case_id, order_id=order_id
+    )
     contracts.validate_evidence(evidence, "MCP tool get_order")
     if evidence["domain"] != "order" or not isinstance(evidence["data"], dict):
         raise ValueError("MCP get_order did not return order evidence")
@@ -1407,7 +1706,7 @@ async def _solve_order_only(
         decision_code="evidence_ready",
         evidence_refs=[evidence_ref],
     )
-    if evidence["data"].get("primary_issue") in _PAYMENT_ISSUES | _REFUND_ISSUES:
+    if evidence["data"].get("primary_issue") in _PAYMENT_ISSUES | _REFUND_ISSUES or invalid_claim:
         result = _slice_insufficient_output(case_id, evidence, [evidence_ref])
     else:
         result = _output(case_id, evidence)
@@ -1425,6 +1724,9 @@ async def _solve_order_only(
         supporting_refs=[evidence_ref],
         authoritative_ids={order_id, *result["affected_entities"].get("item_ids", [])},
     )
+    _verify_result_invariants(result, [*consumed_refs, *[
+        ref for ref in result["evidence_refs"] if ref not in consumed_refs
+    ]])
     contracts.validate_output(result, f"output/{case_id}")
     trace.emit(
         case_id=case_id,
@@ -1459,6 +1761,7 @@ async def solve_case(
             tools,
             policy_tool,
             _policy_required(case),
+            _has_invalid_claim(case),
         )
 
     # Keep the issue-1 path contract-compatible for a gateway that only exposes
@@ -1477,6 +1780,7 @@ async def solve_case(
             trace,
             policy_tool,
             _policy_required(case),
+            _has_invalid_claim(case),
         )
 
     if any(name in specialist_tools for name in ("get_order_items", "get_sellers")):
@@ -1496,13 +1800,16 @@ async def solve_case(
             decision_code="shipment_lookup",
         )
     contracts = trace.contracts
-    evidence = await gateway.call("get_order", case_id=case_id, order_id=order_id)
+    evidence = await _call_gateway(
+        gateway, "get_order", case_id=case_id, order_id=order_id
+    )
     contracts.validate_evidence(evidence, "MCP tool get_order")
     if evidence["domain"] != "order" or not isinstance(evidence["data"], dict):
         raise ValueError("MCP get_order did not return order evidence")
     if evidence["data"].get("order_id") != order_id:
         raise ValueError("MCP get_order returned evidence for a different order")
     evidence_items: dict[str, dict[str, Any]] = {"get_order": evidence}
+    failure_codes: list[str] = []
     order_item_available = any(
         name in specialist_tools for name in ("get_order_items", "get_sellers")
     )
@@ -1517,7 +1824,16 @@ async def solve_case(
     for tool_name in ("get_order_items", "get_sellers", "get_shipment_summary"):
         if tool_name not in specialist_tools:
             continue
-        specialist = await gateway.call(tool_name, case_id=case_id, order_id=order_id)
+        try:
+            specialist = await _call_gateway(
+                gateway, tool_name, case_id=case_id, order_id=order_id
+            )
+        except RuntimeError as exc:
+            # Missing/timeout specialist evidence is not a reason to invent
+            # entities.  The verifier will downgrade the slice because the
+            # corresponding envelope is absent.
+            failure_codes.append(_failure_decision_code(exc))
+            continue
         contracts.validate_evidence(specialist, f"MCP tool {tool_name}")
         evidence_items[tool_name] = specialist
         actor = "shipment-agent" if tool_name == "get_shipment_summary" else "order-item-agent"
@@ -1568,6 +1884,18 @@ async def solve_case(
             decision_code="shipment_evidence_ready",
             evidence_refs=[*order_refs, *shipment_refs],
         )
+    elif not order_item_available:
+        # The advertised shipment specialist may have timed out or returned
+        # not-found.  Still make the coordinator's order envelope observable
+        # as a handoff so failure cases retain an auditable A2A lifecycle.
+        trace.emit(
+            case_id=case_id,
+            event_type="handoff",
+            actor="shipment-agent",
+            target="verifier",
+            decision_code="order_evidence_ready",
+            evidence_refs=[evidence_items["get_order"]["evidence_ref"]],
+        )
 
     result = _slice_output(
         case_id,
@@ -1579,6 +1907,17 @@ async def solve_case(
         consumed_refs,
         order_id,
     )
+    if _has_invalid_claim(case):
+        result = _slice_insufficient_output(
+            case_id,
+            evidence_items["get_order"],
+            consumed_refs,
+            item_ids=result["affected_entities"]["item_ids"],
+            seller_ids=result["affected_entities"]["seller_ids"],
+            shipment_ids=result["affected_entities"]["shipment_ids"],
+            claim_assessments=result.get("claim_assessments"),
+            data_conflicts=result.get("data_conflicts"),
+        )
     _verify_slice(
         result,
         evidence_items["get_order"],
@@ -1601,12 +1940,15 @@ async def solve_case(
         supporting_refs=_entity_supporting_refs(evidence_items, result),
         authoritative_ids=authoritative_ids,
     )
+    _verify_result_invariants(result, [*consumed_refs, *[
+        ref for ref in result["evidence_refs"] if ref not in consumed_refs
+    ]])
     contracts.validate_output(result, f"output/{case_id}")
     trace.emit(
         case_id=case_id,
         event_type="verification_completed",
         actor="verifier",
-        decision_code="output_contract_valid",
+        decision_code=failure_codes[0] if failure_codes else "output_contract_valid",
         evidence_refs=result["evidence_refs"],
     )
     return result

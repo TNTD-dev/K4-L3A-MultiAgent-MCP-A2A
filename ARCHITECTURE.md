@@ -66,20 +66,27 @@ generated locally or reused between cases.
 
 | Failure | Retry? | Fallback | Trace event/code |
 | --- | --- | --- | --- |
-| MCP timeout | No | Fail the case; do not invent output facts | gateway error |
-| Not found | No | Fail the case; do not convert absence into a reference | gateway error |
+| MCP timeout | No (one bounded call) | Downgrade the affected specialist slice; do not invent output facts | `verification_completed:mcp_timeout` |
+| Not found | No | Downgrade the affected specialist slice; do not convert absence into a reference | `verification_completed:mcp_not_found` |
 | Source conflict | No | Record the conflict and fail closed with insufficient evidence | `verification_completed` only after validation |
 | Invalid evidence envelope | No | Fail contract validation | no completion event |
 | Malformed specialist data | No | Emit a contract-shaped insufficient result with consumed refs | `verification_completed` after validation |
 
-Retry phải có giới hạn và idempotent. Không chuyển missing evidence thành dữ liệu phỏng đoán.
+The workflow uses a five-second single-attempt bound for every gateway call. A
+timeout or not-found response is never retried, so an audited request cannot be
+duplicated or race a late response. Optional specialist failures retain only the
+already-consumed order envelope, emit a bounded public decision code, and fail
+closed. Missing evidence is never converted into a guessed entity, claim,
+amount, responsible party, or action.
 
 ## 6. Verification invariants
 
 Before finalize the verifier checks the evidence and output schemas, requires the
 `order` domain and an evidence `order_id` matching the requested ID, requires
-all output refs to equal the consumed refs, filters and deduplicates in-scope
-order/item/seller/shipment identifiers, and preserves claim refs. Contradictory
+all output refs to be consumed, filters and deduplicates in-scope
+order/item/seller/shipment identifiers, and preserves claim refs. Item,
+financial, policy, and shipment rows must carry the requested order scope;
+seller rows are retained only when linked to an in-scope item. Contradictory
 seller/logistics late events are recorded as a conflict and remain insufficient.
 For the financial slice, payment decisions come only from payment evidence;
 refund states, recommended totals, and refund lines come only from refund
@@ -97,8 +104,12 @@ specialists, never verdicts.
 ## 7. Reproducibility
 
 The workflow is deterministic apart from trace event IDs and timestamps: one
-call per discovered relevant tool per case, no concurrency, no random seed, and
-no model call.
+call per discovered relevant tool per case, no retries or concurrency, no random
+seed, and no model call. Artifact validation additionally requires every case
+to have `case_received → task_assigned → handoff → verification_completed →
+case_finalized` in order, and checks that every submitted evidence ref has a
+`tool_result_consumed` event. Trace payloads contain no prompts or chain of
+thought.
 `pyproject.toml` declares bounded dependency version ranges (there is no checked-in
 lockfile); run `pytest -q` and `ruff check .`. API keys are never written to
 source, output, or trace.

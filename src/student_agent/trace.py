@@ -8,6 +8,15 @@ from typing import Any
 
 from .contracts import Contracts
 
+_FORBIDDEN_TRACE_KEYS = {
+    "prompt",
+    "prompts",
+    "cot",
+    "chain_of_thought",
+    "reasoning",
+    "thoughts",
+}
+
 
 class TraceWriter:
     """Append observable workflow events. Never put prompts or chain-of-thought here."""
@@ -45,6 +54,12 @@ class TraceWriter:
             "attributes": attributes,
         }
         event.update({key: value for key, value in optional.items() if value is not None})
+        if any(isinstance(key, str) and key.lower() in _FORBIDDEN_TRACE_KEYS for key in event):
+            raise ValueError("trace cannot contain prompt or chain-of-thought content")
+        if isinstance(attributes, dict) and any(
+            isinstance(key, str) and key.lower() in _FORBIDDEN_TRACE_KEYS for key in attributes
+        ):
+            raise ValueError("trace attributes cannot contain prompt or chain-of-thought content")
         self.contracts.validate_trace(event, "trace event")
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
