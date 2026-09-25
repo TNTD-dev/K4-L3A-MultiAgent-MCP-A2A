@@ -16,7 +16,9 @@ The coordinator discovers the server tools, assigns only specialists whose tools
 were advertised and whose domain is relevant to the case, and passes their
 validated evidence envelopes to the verifier. Order/item/seller/shipment cases
 use the entity slice; payment/refund cases use the financial slice, which
-requires payment and refund evidence before it can finalize.
+requires payment and refund evidence before it can finalize. When a policy tool
+is advertised, the policy specialist consumes the verified slice and its
+validated `policy` envelope to produce the final issue/status/action decision.
 The CLI emits `case_received` and `case_finalized`; `solve_case` emits
 assignments, per-result consumption, handoffs, and verification events between
 them. The input's customer message supplies only lookup and claim identifiers;
@@ -31,7 +33,7 @@ entity facts and claim verdicts are projected from MCP envelopes.
 | Payment | explicit order lookup and financial claim scope | Call only discovered `get_payment`; derive payment issue and payment references from its scoped envelope | `tool_result_consumed` → `handoff` to verifier |
 | Refund | explicit order lookup and financial claim scope | Call only discovered `get_refund`; derive refund state, BRL totals, and refund lines from its scoped envelope | `tool_result_consumed` → `handoff` to verifier |
 | Shipment | explicit `order_id` and coordinator assignment | Call only discovered `get_shipment_summary`; use explicit late events and shipment IDs only | `tool_result_consumed` → `handoff` to verifier |
-| Policy | not in the first path | Reserved for a later specialist; no policy facts are inferred here | none |
+| Policy | validated operational/financial handoffs and discovered policy tool | Call only the discovered policy tool, apply explicit policy fields, and fail closed when policy evidence is missing or inconclusive | `policy_decided` → verifier |
 | Verifier | validated MCP envelope and proposed output | Validate evidence and L3A output contracts, then mark verification complete | `verification_completed` → coordinator |
 
 Nêu rõ actor nào được quyền gọi tool nào. Tránh cho mọi agent quyền truy vấn tất cả tool nếu không cần thiết.
@@ -79,10 +81,15 @@ seller/logistics late events are recorded as a conflict and remain insufficient.
 For the financial slice, payment decisions come only from payment evidence;
 refund states, recommended totals, and refund lines come only from refund
 evidence. Every refund-line `entity_id` must match an authoritative in-scope
-order, item, or payment reference. Unsupported or missing decision domains
-remain insufficient; the workflow never manufactures a shipment ID, seller,
-cause, action, or refund from a customer message. Claim topics are hypotheses
-used only to select relevant specialists, never verdicts.
+order, item, or payment reference. A discovered policy envelope must contain an
+explicit schema-supported issue, status, confidence, and unique bounded actions;
+action/status and policy refund totals are checked before finalization. Policy
+responsible sellers must match an authoritative seller ID. Unsupported or
+missing decision domains remain insufficient, and policy output cites only
+consumed refs that support the retained facts plus the policy ref. The workflow
+never manufactures a shipment ID, seller, cause, action, or refund from a
+customer message. Claim topics are hypotheses used only to select relevant
+specialists, never verdicts.
 
 ## 7. Reproducibility
 

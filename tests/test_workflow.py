@@ -46,6 +46,52 @@ class PaymentRefundGateway(StubGateway):
         return self.responses[tool_name]
 
 
+class PolicyGateway(StubGateway):
+    def __init__(self, order: dict[str, Any], policy: dict[str, Any]):
+        super().__init__(order)
+        self.responses = {"get_order": order, "get_policy": policy}
+
+    async def list_tools(self) -> list[str]:
+        return list(self.responses)
+
+    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        self.calls.append((tool_name, case_id, arguments))
+        return self.responses[tool_name]
+
+
+def _policy_evidence(
+    *,
+    issue: str = "canceled_order_paid",
+    status: str = "action_required",
+    actions: list[str] | None = None,
+    confidence: float = 0.9,
+    inconclusive: bool = False,
+) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "order_id": "order-1",
+        "primary_issue": issue,
+        "case_status": status,
+        "confidence": confidence,
+        "responsible_parties": [{"party_type": "platform", "party_id": None}],
+        "resolution_actions": actions if actions is not None else ["issue_refund"],
+        "recommended_refund_brl": 10 if status == "action_required" else 0,
+        "refund_lines": (
+            [{"reason_code": "policy_refund", "amount_brl": 10, "entity_id": "order-1"}]
+            if status == "action_required"
+            else []
+        ),
+    }
+    if inconclusive:
+        data["policy_status"] = "inconclusive"
+    return {
+        "schema_version": "day09-mcp-evidence-v1",
+        "evidence_ref": "ev_policy_12345678901234567890",
+        "result_hash": f"sha256:{hashlib.sha256(b'policy').hexdigest()}",
+        "domain": "policy",
+        "data": data,
+    }
+
+
 def _contracts() -> Contracts:
     root = Path(__file__).resolve().parents[1]
     return Contracts(root / "contracts" / "schemas")
@@ -776,3 +822,63 @@ def test_slice_marks_payment_claim_insufficient_without_payment_evidence(tmp_pat
         "confidence": 0.0,
     }
     assert output["claim_assessments"][0]["verdict"] == "insufficient_evidence"
+
+
+@pytest.mark.parametrize(
+    ("status", "issue", "actions"),
+    [
+        ("action_required", "canceled_order_paid", ["issue_refund"]),
+        ("no_action", "valid_split_payment", []),
+        ("needs_investigation", "insufficient_evidence", []),
+    ],
+)
+def test_policy_decision_paths_are_consistent(
+    tmp_path: Path, status: str, issue: str, actions: list[str]
+) -> None:
+    policy = _policy_evidence(issue=issue, status=status, actions=actions)
+    gateway = PolicyGateway(_evidence(), policy)
+    contracts = _contracts()
+    trace_path = tmp_path / "trace.jsonl"
+    trace = TraceWriter(trace_path, contracts)
+
+    output = asyncio.run(
+        solve_case({"case_id": "CASE_001", "order_id": "order-1"}, gateway, trace)
+    )
+
+    contracts.validate_output(output, "policy output")
+    assert output["assessment"] == {
+        "primary_issue": issue if status != "needs_investigation" else "insufficient_evidence",
+        "case_status": status,
+        "confidence": 0.9 if status != "needs_investigation" else 0.0,
+    }
+    assert output["resolution_actions"] == (actions if status != "needs_investigation" else [])
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    policy_events = [event for event in events if event["event_type"] == "policy_decided"]
+    assert len(policy_events) == 1
+    assert policy_events[0]["evidence_refs"] == output["evidence_refs"]
+    assert gateway.calls == [
+        ("get_order", "CASE_001", {"order_id": "order-1"}),
+        ("get_policy", "CASE_001", {"order_id": "order-1"}),
+    ]
+
+
+def test_inconclusive_policy_fails_closed_and_keeps_policy_trace(tmp_path: Path) -> None:
+    policy = _policy_evidence(inconclusive=True)
+    gateway = PolicyGateway(_evidence(), policy)
+    contracts = _contracts()
+    trace_path = tmp_path / "trace.jsonl"
+    output = asyncio.run(
+        solve_case(
+            {"case_id": "CASE_001", "order_id": "order-1"},
+            gateway,
+            TraceWriter(trace_path, contracts),
+        )
+    )
+
+    assert output["assessment"] == {
+        "primary_issue": "insufficient_evidence",
+        "case_status": "needs_investigation",
+        "confidence": 0.0,
+    }
+    assert output["resolution_actions"] == []
+    assert policy["evidence_ref"] in output["evidence_refs"]
