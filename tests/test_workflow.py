@@ -15,7 +15,7 @@ from student_agent import VARIANT_ID, cli
 from student_agent.cases import CaseSet
 from student_agent.config import Settings
 from student_agent.contracts import Contracts
-from student_agent.submission import validate_artifacts
+from student_agent.submission import _validate_trace_lifecycle, validate_artifacts
 from student_agent.trace import TraceWriter
 from student_agent.workflow import solve_case
 
@@ -1099,3 +1099,149 @@ def test_cross_case_seller_rows_are_not_authoritative(tmp_path: Path) -> None:
     )
     assert output["assessment"]["primary_issue"] == "insufficient_evidence"
     assert "seller-cross-case" not in output["affected_entities"]["seller_ids"]
+
+
+def test_cross_scope_auxiliary_refs_are_not_submitted(tmp_path: Path) -> None:
+    evidence = _slice_evidence("seller", case_tag="014")
+    evidence["get_shipment_summary"]["data"]["events"].append(
+        {
+            "actor": "seller",
+            "event_at": "2018-01-03T09:00:00-03:00",
+            "event_type": "delivered_late",
+            "order_id": "order-2",
+            "shipment_id": "wrong-shipment",
+            "status": "confirmed",
+        }
+    )
+    output = asyncio.run(
+        solve_case(
+            {
+                "case_id": "CASE_014",
+                "customer_request": {
+                    "claimed_order_id": "order-1",
+                    "claims": [{"claim_id": "c", "topic": "late_delivery_seller"}],
+                },
+            },
+            SliceGateway(evidence),
+            TraceWriter(tmp_path / "trace.jsonl", _contracts()),
+        )
+    )
+    assert output["assessment"]["primary_issue"] == "insufficient_evidence"
+    assert evidence["get_shipment_summary"]["evidence_ref"] not in output["evidence_refs"]
+
+
+def test_tool_discovery_timeout_is_bounded_and_traced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import student_agent.workflow as workflow
+
+    class DiscoveryTimeoutGateway(StubGateway):
+        async def list_tools(self) -> list[str]:
+            await asyncio.sleep(0.05)
+            return ["get_order"]
+
+    monkeypatch.setattr(workflow, "_MCP_CALL_TIMEOUT_SECONDS", 0.001)
+    trace_path = tmp_path / "trace.jsonl"
+    with pytest.raises(RuntimeError, match="discovery"):
+        asyncio.run(
+            solve_case(
+                {"case_id": "CASE_015", "order_id": "order-1"},
+                DiscoveryTimeoutGateway(_evidence()),
+                TraceWriter(trace_path, _contracts()),
+            )
+        )
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert events[-1]["decision_code"] == "mcp_timeout"
+
+
+def test_required_get_order_not_found_is_traced(tmp_path: Path) -> None:
+    class NoOrderGateway(StubGateway):
+        async def list_tools(self) -> list[str]:
+            return ["get_payment"]
+
+    trace_path = tmp_path / "trace.jsonl"
+    with pytest.raises(RuntimeError, match="required get_order"):
+        asyncio.run(
+            solve_case(
+                {"case_id": "CASE_016", "order_id": "order-1"},
+                NoOrderGateway(_evidence()),
+                TraceWriter(trace_path, _contracts()),
+            )
+        )
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert events[-1]["decision_code"] == "mcp_not_found"
+
+
+def test_malformed_specialist_envelope_fails_with_public_code(tmp_path: Path) -> None:
+    evidence = _slice_evidence(None, case_tag="017")
+    evidence["get_order_items"]["evidence_ref"] = "bad-ref"
+    trace_path = tmp_path / "trace.jsonl"
+    with pytest.raises(ValueError):
+        asyncio.run(
+            solve_case(
+                {"case_id": "CASE_017", "order_id": "order-1"},
+                SliceGateway(evidence),
+                TraceWriter(trace_path, _contracts()),
+            )
+        )
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert events[-1]["decision_code"] == "mcp_malformed"
+
+
+def test_lifecycle_rejects_events_after_verification_and_accepts_blank_lines() -> None:
+    def event(event_type: str, actor: str = "agent") -> dict[str, Any]:
+        result: dict[str, Any] = {"event_type": event_type, "case_id": "CASE_018", "actor": actor}
+        if event_type == "task_assigned":
+            result["target"] = "specialist"
+        if event_type == "handoff":
+            result["target"] = "verifier"
+        if event_type == "tool_result_consumed":
+            result.update({"tool_name": "get_order", "evidence_refs": ["ev_12345678901234567890"]})
+        return result
+
+    valid = [
+        event("case_received", "coordinator"),
+        event("task_assigned", "coordinator"),
+        event("tool_result_consumed"),
+        event("handoff"),
+        event("verification_completed", "verifier"),
+        event("case_finalized", "coordinator"),
+    ]
+    _validate_trace_lifecycle(
+        {"CASE_018": {"evidence_refs": []}},
+        [json.dumps(item) for item in valid[:2]]
+        + [""]
+        + [json.dumps(item) for item in valid[2:]],
+        {"CASE_018"},
+    )
+    invalid = [*valid[:-1], event("task_assigned", "coordinator"), valid[-1]]
+    with pytest.raises(ValueError, match="after verification"):
+        _validate_trace_lifecycle(
+            {"CASE_018": {"evidence_refs": []}},
+            [json.dumps(item) for item in invalid],
+            {"CASE_018"},
+        )
+
+
+def test_trace_leak_guard_checks_values_without_blocking_promptly(tmp_path: Path) -> None:
+    trace = TraceWriter(tmp_path / "trace.jsonl", _contracts())
+    trace.emit(
+        case_id="CASE_019",
+        event_type="case_received",
+        actor="coordinator",
+        attributes={"note": "promptly received"},
+    )
+    with pytest.raises(ValueError, match="prompt"):
+        trace.emit(
+            case_id="CASE_019",
+            event_type="task_assigned",
+            actor="coordinator",
+            attributes={"note": "include the customer prompt here"},
+        )
+    with pytest.raises(ValueError, match="chain-of-thought"):
+        trace.emit(
+            case_id="CASE_019",
+            event_type="task_assigned",
+            actor="coordinator",
+            attributes={"nested": ["private chain of thought"]},
+        )

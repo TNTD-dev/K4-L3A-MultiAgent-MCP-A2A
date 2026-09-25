@@ -65,6 +65,22 @@ async def _call_gateway(
     return result
 
 
+async def _list_tools(gateway: EvidenceGateway) -> list[str]:
+    """Discover tools once, with the same bounded request policy as calls."""
+
+    try:
+        tools = await asyncio.wait_for(
+            gateway.list_tools(), timeout=_MCP_CALL_TIMEOUT_SECONDS
+        )
+    except TimeoutError as exc:
+        raise RuntimeError("MCP tool discovery timed out") from exc
+    if not isinstance(tools, list) or not all(
+        isinstance(tool, str) and tool for tool in tools
+    ):
+        raise ValueError("MCP tool discovery returned a malformed tool list")
+    return list(dict.fromkeys(tools))
+
+
 def _failure_decision_code(error: BaseException) -> str:
     """Map gateway failures to compact public decision codes."""
 
@@ -73,6 +89,15 @@ def _failure_decision_code(error: BaseException) -> str:
         return "mcp_timeout"
     if "not found" in message or "not_found" in message:
         return "mcp_not_found"
+    if (
+        "schema" in message
+        or "malformed" in message
+        or "object result" in message
+        or "mcp tool" in message and ":" in message
+    ):
+        return "mcp_malformed"
+    if "scope" in message or "order" in message or "domain" in message:
+        return "mcp_scope_violation"
     return "mcp_failure"
 
 
@@ -1738,7 +1763,7 @@ async def _solve_order_only(
     return result
 
 
-async def solve_case(
+async def _solve_case_impl(
     case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
 ) -> dict[str, Any]:
     """Run the coordinator and the discovered order/item/shipment specialists."""
@@ -1747,7 +1772,12 @@ async def solve_case(
     if not isinstance(case_id, str) or not case_id:
         raise ValueError("case must contain a non-empty case_id")
     order_id = _order_id(case)
-    tools = await gateway.list_tools()
+    try:
+        tools = await _list_tools(gateway)
+    except (RuntimeError, ValueError) as exc:
+        raise RuntimeError(
+            f"MCP tool discovery failed: {_failure_decision_code(exc)}"
+        ) from exc
     if "get_order" not in tools:
         raise RuntimeError("MCP Gateway does not expose the required get_order tool")
 
@@ -1810,6 +1840,7 @@ async def solve_case(
         raise ValueError("MCP get_order returned evidence for a different order")
     evidence_items: dict[str, dict[str, Any]] = {"get_order": evidence}
     failure_codes: list[str] = []
+    unsafe_tools: set[str] = set()
     order_item_available = any(
         name in specialist_tools for name in ("get_order_items", "get_sellers")
     )
@@ -1835,6 +1866,14 @@ async def solve_case(
             failure_codes.append(_failure_decision_code(exc))
             continue
         contracts.validate_evidence(specialist, f"MCP tool {tool_name}")
+        if not _evidence_in_scope(specialist, specialist.get("domain"), order_id):
+            # A foreign envelope is not safe merely because the final output
+            # is downgraded.  Keep it only long enough to project already
+            # in-scope IDs; discard its ref and all positive conclusions.
+            failure_codes.append("mcp_scope_violation")
+            evidence_items[tool_name] = specialist
+            unsafe_tools.add(tool_name)
+            continue
         evidence_items[tool_name] = specialist
         actor = "shipment-agent" if tool_name == "get_shipment_summary" else "order-item-agent"
         trace.emit(
@@ -1845,16 +1884,21 @@ async def solve_case(
             evidence_refs=[specialist["evidence_ref"]],
         )
 
-    consumed = list(evidence_items.values())
+    consumed = [
+        item
+        for name, item in evidence_items.items()
+        if name not in unsafe_tools
+    ]
     consumed_refs = [item["evidence_ref"] for item in consumed]
     order_refs = [
         evidence_items[name]["evidence_ref"]
         for name in ("get_order", "get_order_items", "get_sellers")
-        if name in evidence_items
+        if name in evidence_items and name not in unsafe_tools
     ]
     shipment_refs = (
         [evidence_items["get_shipment_summary"]["evidence_ref"]]
         if "get_shipment_summary" in evidence_items
+        and "get_shipment_summary" not in unsafe_tools
         else []
     )
     if order_refs and order_item_available:
@@ -1907,7 +1951,18 @@ async def solve_case(
         consumed_refs,
         order_id,
     )
-    if _has_invalid_claim(case):
+    if unsafe_tools or _has_invalid_claim(case):
+        safe_claim_assessments = [
+            {
+                **claim,
+                "evidence_refs": [
+                    ref
+                    for ref in claim.get("evidence_refs", [])
+                    if ref in consumed_refs
+                ],
+            }
+            for claim in result.get("claim_assessments", [])
+        ]
         result = _slice_insufficient_output(
             case_id,
             evidence_items["get_order"],
@@ -1915,7 +1970,7 @@ async def solve_case(
             item_ids=result["affected_entities"]["item_ids"],
             seller_ids=result["affected_entities"]["seller_ids"],
             shipment_ids=result["affected_entities"]["shipment_ids"],
-            claim_assessments=result.get("claim_assessments"),
+            claim_assessments=safe_claim_assessments,
             data_conflicts=result.get("data_conflicts"),
         )
     _verify_slice(
@@ -1937,7 +1992,14 @@ async def solve_case(
         policy_tool=policy_tool,
         required=_policy_required(case),
         consumed_refs=consumed_refs,
-        supporting_refs=_entity_supporting_refs(evidence_items, result),
+        supporting_refs=_entity_supporting_refs(
+            {
+                name: item
+                for name, item in evidence_items.items()
+                if name not in unsafe_tools
+            },
+            result,
+        ),
         authoritative_ids=authoritative_ids,
     )
     _verify_result_invariants(result, [*consumed_refs, *[
@@ -1952,3 +2014,36 @@ async def solve_case(
         evidence_refs=result["evidence_refs"],
     )
     return result
+
+
+async def solve_case(
+    case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
+) -> dict[str, Any]:
+    """Run one case and expose contract/gateway failures in the trace."""
+
+    case_id = case.get("case_id")
+    if not isinstance(case_id, str) or not case_id:
+        raise ValueError("case must contain a non-empty case_id")
+    try:
+        return await _solve_case_impl(case, gateway, trace)
+    except (RuntimeError, ValueError) as exc:
+        code_error: BaseException = exc.__cause__ or exc
+        code = (
+            "mcp_not_found"
+            if "required get_order" in str(exc)
+            else _failure_decision_code(code_error)
+        )
+        trace.emit(
+            case_id=case_id,
+            event_type="task_assigned",
+            actor="coordinator",
+            target="verifier",
+            decision_code="failure_review",
+        )
+        trace.emit(
+            case_id=case_id,
+            event_type="verification_completed",
+            actor="verifier",
+            decision_code=code,
+        )
+        raise

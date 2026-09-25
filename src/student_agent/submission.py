@@ -14,6 +14,29 @@ from .contracts import Contracts
 SECRET_PATTERN = re.compile(r"sk-team-[A-Za-z0-9_-]{8,}")
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SUBMISSION_BYTES = 12 * 1024 * 1024
+_TRACE_LEAK_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bprompt\b",
+        r"\b(?:chain[\s_-]+of[\s_-]+thought)\b",
+        r"\bcot\b",
+        r"\b(?:hidden|private)\s+(?:reasoning|thoughts?)\b",
+        r"\bthought\s+process\b",
+    )
+)
+
+
+def _trace_contains_leak(value: Any) -> bool:
+    if isinstance(value, str):
+        return any(pattern.search(value) for pattern in _TRACE_LEAK_PATTERNS)
+    if isinstance(value, dict):
+        return any(
+            _trace_contains_leak(key) or _trace_contains_leak(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_trace_contains_leak(item) for item in value)
+    return False
 
 
 def _json_object(path: Path) -> dict[str, Any]:
@@ -95,16 +118,15 @@ def _validate_trace_lifecycle(
 
     events_by_case: dict[str, list[dict[str, Any]]] = {case_id: [] for case_id in expected}
     for line in trace_lines:
+        if not line.strip():
+            continue
         event = json.loads(line)
         # Prompt text and hidden reasoning do not belong in an observable
         # public trace, including nested attribute objects.
         suspicious = {"prompt", "prompts", "cot", "chain_of_thought", "reasoning", "thoughts"}
         if any(key.lower() in suspicious for key in event):
             raise ValueError("trace contains prompt or chain-of-thought content")
-        attributes = event.get("attributes")
-        if isinstance(attributes, dict) and any(
-            key.lower() in suspicious for key in attributes
-        ):
+        if _trace_contains_leak(event):
             raise ValueError("trace attributes contain prompt or chain-of-thought content")
         events_by_case[event["case_id"]].append(event)
 
@@ -121,17 +143,36 @@ def _validate_trace_lifecycle(
         missing = required - set(event_types)
         if missing:
             raise ValueError(f"trace for {case_id} is missing lifecycle events: {sorted(missing)}")
-        positions = {event_type: event_types.index(event_type) for event_type in required}
-        if positions["case_received"] != 0 or positions["case_finalized"] != len(events) - 1:
+        if event_types[0] != "case_received" or event_types[-1] != "case_finalized":
             raise ValueError(f"trace for {case_id} does not span receive-to-finalize")
-        if not (
-            positions["case_received"]
-            < positions["task_assigned"]
-            < positions["handoff"]
-            < positions["verification_completed"]
-            < positions["case_finalized"]
-        ):
-            raise ValueError(f"trace for {case_id} has invalid lifecycle ordering")
+        if event_types.count("case_received") != 1 or event_types.count("case_finalized") != 1:
+            raise ValueError(f"trace for {case_id} has duplicate boundary events")
+        if event_types.count("verification_completed") != 1:
+            raise ValueError(f"trace for {case_id} has invalid verification events")
+        assigned = consumed = handed_off = verified = False
+        for event in events:
+            event_type = event["event_type"]
+            if verified and event_type != "case_finalized":
+                raise ValueError(f"trace for {case_id} has events after verification")
+            if event_type == "task_assigned":
+                assigned = True
+            elif event_type == "tool_result_consumed":
+                if not assigned:
+                    raise ValueError(f"trace for {case_id} consumes before assignment")
+                consumed = True
+            elif event_type == "handoff":
+                if not assigned or not consumed:
+                    raise ValueError(f"trace for {case_id} hands off before evidence")
+                handed_off = True
+            elif event_type == "policy_decided":
+                if not handed_off:
+                    raise ValueError(f"trace for {case_id} decides policy before handoff")
+            elif event_type == "verification_completed":
+                if not handed_off:
+                    raise ValueError(f"trace for {case_id} verifies before handoff")
+                verified = True
+            elif event_type == "case_finalized" and not verified:
+                raise ValueError(f"trace for {case_id} finalizes before verification")
         if not any(
             event["event_type"] == "task_assigned"
             and event.get("actor") == "coordinator"
